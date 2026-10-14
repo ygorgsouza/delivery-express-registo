@@ -686,6 +686,7 @@ async function saveOperations(ops){
     }, { merge: true });
     setConnStatus(true);
     ensureAllOpsHaveRecordsListener();
+    ensurePesosListeners();
     return true;
   } catch(e){
     console.error('saveOperations falhou', e);
@@ -846,7 +847,7 @@ function ensureAllOpsHaveRecordsListener(){
 
 const _pesosListeners = {};
 function ensurePesosListeners(){
-  PESOS_OPS.forEach(opId=>{
+  pesosOps().forEach(opId=>{
     if (_pesosListeners[opId]) return;
     _pesosListeners[opId] = db.collection('pesos').doc(opId).onSnapshot(doc=>{
       STATE.pesosCache[opId] = doc.exists ? (doc.data().entries || {}) : {};
@@ -874,6 +875,7 @@ function setupRealtimeListeners(){
       STATE.importFlags = data.importFlags || {};
     }
     ensureAllOpsHaveRecordsListener();
+    ensurePesosListeners();
     setConnStatus(true);
     if (!isEditingNow()) render();
   }, err=>{
@@ -906,7 +908,8 @@ let STATE = {
 
 // Operações com registo de pesos ativo (para faturação por escalão de peso).
 // Para ativar noutra operação, basta acrescentar o respetivo id aqui.
-const PESOS_OPS = ['delta_montijo'];
+// Operações com registo de pesos: definido por cliente em Configurações (campo usePesos).
+function pesosOps(){ return STATE.operations.filter(o=>o.usePesos).map(o=>o.id); }
 
 function todayISO(){
   const d = new Date();
@@ -3241,7 +3244,7 @@ function renderAlertas(){
 // ============================================================
 // RENDER: PESOS TAB (registo de kg para faturação por escalão de peso)
 // ============================================================
-let pesosSel = { opId: PESOS_OPS[0] || null, date: todayISO() };
+let pesosSel = { opId: null, date: todayISO() };
 
 function parseWeights(text){
   return text
@@ -3261,12 +3264,13 @@ function renderPesos(){
   const body = document.getElementById('de-body');
   const wrap = document.createElement('div');
 
-  if (!PESOS_OPS.length){
-    wrap.innerHTML = `<div class="de-empty">${ICONS.warning} Nenhuma operação tem o registo de pesos ativo.</div>`;
+  const PESOS_LIST = pesosOps();
+  if (!PESOS_LIST.length){
+    wrap.innerHTML = `<div class="de-empty">${ICONS.warning} Nenhuma operação tem o registo de pesos ativo.<br/><span style="font-size:12px;">Ativa em Configurações → abre o cliente → "Registo de pesos" = Sim.</span></div>`;
     body.innerHTML = ''; body.appendChild(wrap);
     return;
   }
-  if (!pesosSel.opId || !PESOS_OPS.includes(pesosSel.opId)) pesosSel.opId = PESOS_OPS[0];
+  if (!pesosSel.opId || !PESOS_LIST.includes(pesosSel.opId)) pesosSel.opId = PESOS_LIST[0];
 
   const op = STATE.operations.find(o=>o.id===pesosSel.opId);
   const opName = op ? op.name : pesosSel.opId;
@@ -3284,7 +3288,7 @@ function renderPesos(){
   const nav = document.createElement('div');
   nav.className = 'de-row';
   nav.innerHTML = `
-    ${PESOS_OPS.length > 1 ? `<div class="de-field"><label>Operação</label><select id="pesos-op">${PESOS_OPS.map(id=>{ const o2 = STATE.operations.find(x=>x.id===id); return `<option value="${id}" ${id===pesosSel.opId?'selected':''}>${o2?o2.name:id}</option>`; }).join('')}</select></div>` : ''}
+    ${PESOS_LIST.length > 1 ? `<div class="de-field"><label>Operação</label><select id="pesos-op">${PESOS_LIST.map(id=>{ const o2 = STATE.operations.find(x=>x.id===id); return `<option value="${id}" ${id===pesosSel.opId?'selected':''}>${o2?o2.name:id}</option>`; }).join('')}</select></div>` : ''}
     <div class="de-field">
       <label>Mês</label>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -3366,16 +3370,18 @@ function renderPesos(){
   // KMS, EDR%) com os escalões de peso (0-30 / 31kg+), no mesmo formato
   // da folha de cálculo original. Fixo à operação Delta Montijo.
   // ------------------------------------------------------------
-  const REPORT_OP_ID = 'delta_montijo';
+  const REPORT_OP_ID = pesosSel.opId;
   const repOp = STATE.operations.find(o=>o.id===REPORT_OP_ID);
   const repRecords = STATE.recordsCache[REPORT_OP_ID] || {};
   const repWeights = STATE.pesosCache[REPORT_OP_ID] || {};
+  const repCols = (repOp && repOp.fields) ? repOp.fields : [];
 
   function diaSemanaLabel(dow){
     return ['domingo','segunda-feira','terça-feira','quarta-feira','quinta-feira','sexta-feira','sábado'][dow];
   }
 
-  const rTotals = { enc:0, ent:0, nao:0, canc:0, aus:0, recu:0, falh:0, mor:0, kms:0, b1:0, b2:0 };
+  const colTotals = repCols.map(()=>0);
+  const rTotals = { ent:0, enc:0, b1:0, b2:0 };
   let diasComDados = 0;
   const reportRowsData = monthDates.map(ds=>{
     const d = Number(ds.slice(8,10));
@@ -3386,32 +3392,23 @@ function renderPesos(){
     const { b1, b2 } = bucketizeWeights(w);
     if (!hasData) return { d, dow, hasData:false };
     const f = rec.fixed || {};
-    const enc = Number(f.encomendas)||0, ent = Number(f.entregues)||0, nao = Number(f.nao_entregues)||0,
-          canc = Number(f.cancelada)||0, aus = Number(f.ausente)||0, recu = Number(f.recusado)||0,
-          falh = Number(f.falhada_de)||0, mor = Number(f.morada_errada)||0, kms = Number(f.kms)||0;
+    const vals = repCols.map(c=>Number(f[c.key])||0);
+    const enc = dayTotal(repOp, rec), ent = dayEntregues(repOp, rec);
     const edr = enc>0 ? ent/enc : null;
-    rTotals.enc+=enc; rTotals.ent+=ent; rTotals.nao+=nao; rTotals.canc+=canc; rTotals.aus+=aus;
-    rTotals.recu+=recu; rTotals.falh+=falh; rTotals.mor+=mor; rTotals.kms+=kms; rTotals.b1+=b1; rTotals.b2+=b2;
+    vals.forEach((v,i)=>{ colTotals[i]+=v; });
+    rTotals.enc+=enc; rTotals.ent+=ent; rTotals.b1+=b1; rTotals.b2+=b2;
     diasComDados++;
-    return { d, dow, hasData:true, enc, ent, nao, canc, aus, recu, falh, mor, kms, edr, b1, b2 };
+    return { d, dow, hasData:true, vals, edr, b1, b2 };
   });
 
   const reportRowsHtml = reportRowsData.map(r=>{
     if (!r.hasData){
-      return `<tr><td>${r.d}</td><td style="color:var(--text-faint);">${diaSemanaLabel(r.dow)}</td><td colspan="13"></td></tr>`;
+      return `<tr><td>${r.d}</td><td style="color:var(--text-faint);">${diaSemanaLabel(r.dow)}</td><td colspan="${repCols.length+4}"></td></tr>`;
     }
     return `<tr>
       <td>${r.d}</td>
       <td>${diaSemanaLabel(r.dow)}</td>
-      <td>${fmt(r.enc)}</td>
-      <td>${fmt(r.ent)}</td>
-      <td style="color:var(--red);">${fmt(r.nao)}</td>
-      <td>${fmt(r.canc)}</td>
-      <td>${fmt(r.aus)}</td>
-      <td>${fmt(r.recu)}</td>
-      <td>${fmt(r.falh)}</td>
-      <td>${fmt(r.mor)}</td>
-      <td>${fmt(r.kms)}</td>
+      ${r.vals.map((v,i)=>`<td${repCols[i].role==='nao_entregues'?' style="color:var(--red);"':''}>${fmt(v)}</td>`).join('')}
       <td>${edrHtml(r.edr)}</td>
       <td style="color:var(--green);font-weight:700;">${r.b1||'—'}</td>
       <td style="color:var(--blue);font-weight:700;">${r.b2||'—'}</td>
@@ -3433,28 +3430,20 @@ function renderPesos(){
     <div style="overflow-x:auto;">
     <table class="de-table">
       <thead><tr>
-        <th>Dia</th><th>Dia Semana</th><th>Encomendas</th><th>Entregues</th><th>Não Entregues</th>
-        <th>Cancelada</th><th>Ausente</th><th>Recusado</th><th>Falhada DE</th><th>Morada Errada</th>
-        <th>KMS</th><th>EDR%</th><th>0 - 30</th><th>31 - 60</th><th>Total</th>
+        <th>Dia</th><th>Dia Semana</th>${repCols.map(c=>`<th>${c.label}</th>`).join('')}<th>EDR%</th><th>0 - 30</th><th>31kg+</th><th>Total</th>
       </tr></thead>
       <tbody>${reportRowsHtml}</tbody>
       <tfoot>
         <tr style="font-weight:800;">
           <td colspan="2">TOTAL</td>
-          <td>${fmt(rTotals.enc)}</td><td>${fmt(rTotals.ent)}</td>
-          <td style="color:var(--red);">${fmt(rTotals.nao)}</td>
-          <td>${fmt(rTotals.canc)}</td><td>${fmt(rTotals.aus)}</td><td>${fmt(rTotals.recu)}</td>
-          <td>${fmt(rTotals.falh)}</td><td>${fmt(rTotals.mor)}</td><td>${fmt(rTotals.kms)}</td>
+          ${colTotals.map((t,i)=>`<td${repCols[i].role==='nao_entregues'?' style="color:var(--red);"':''}>${fmt(t)}</td>`).join('')}
           <td>${edrHtml(rEdrTotal)}</td>
           <td style="color:var(--green);">${rTotals.b1}</td><td style="color:var(--blue);">${rTotals.b2}</td>
           <td>${rTotals.b1 + rTotals.b2}</td>
         </tr>
         <tr style="font-weight:800;">
           <td colspan="2">MÉDIA</td>
-          <td>${avg(rTotals.enc)}</td><td>${avg(rTotals.ent)}</td>
-          <td style="color:var(--red);">${avg(rTotals.nao)}</td>
-          <td>${avg(rTotals.canc)}</td><td>${avg(rTotals.aus)}</td><td>${avg(rTotals.recu)}</td>
-          <td>${avg(rTotals.falh)}</td><td>${avg(rTotals.mor)}</td><td>${avg(rTotals.kms)}</td>
+          ${colTotals.map((t,i)=>`<td${repCols[i].role==='nao_entregues'?' style="color:var(--red);"':''}>${avg(t)}</td>`).join('')}
           <td>—</td>
           <td style="color:var(--green);">${avg(rTotals.b1)}</td><td style="color:var(--blue);">${avg(rTotals.b2)}</td>
           <td>${avg(rTotals.b1 + rTotals.b2)}</td>
@@ -3469,11 +3458,11 @@ function renderPesos(){
   body.appendChild(wrap);
 
   document.getElementById('pesos-report-export').onclick = ()=>{
-    let csv = 'Dia;Dia Semana;Encomendas;Entregues;Não Entregues;Cancelada;Ausente;Recusado;Falhada DE;Morada Errada;KMS;EDR%;0-30;31-60;Total\n';
+    let csv = 'Dia;Dia Semana;' + repCols.map(c=>c.label).join(';') + ';EDR%;0-30;31kg+;Total\n';
     reportRowsData.forEach(r=>{
-      if (!r.hasData){ csv += `${r.d};${diaSemanaLabel(r.dow)};;;;;;;;;;;;;\n`; return; }
+      if (!r.hasData){ csv += `${r.d};${diaSemanaLabel(r.dow)}${';'.repeat(repCols.length+4)}\n`; return; }
       const edrPct = r.edr!==null ? (Math.round(r.edr*1000)/10)+'%' : '';
-      csv += `${r.d};${diaSemanaLabel(r.dow)};${r.enc};${r.ent};${r.nao};${r.canc};${r.aus};${r.recu};${r.falh};${r.mor};${r.kms};${edrPct};${r.b1};${r.b2};${r.b1+r.b2}\n`;
+      csv += `${r.d};${diaSemanaLabel(r.dow)};${r.vals.join(';')};${edrPct};${r.b1};${r.b2};${r.b1+r.b2}\n`;
     });
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -3614,7 +3603,7 @@ function renderConfig(){
     const entCount = op.repeating ? op.repeating.entities.length : 0;
     item.innerHTML = `
       <div>
-        <div class="name">${op.name} <span class="de-badge ${op.active?'active':'inactive'}">${op.active?'ativa':'inativa'}</span> <span class="de-badge" style="background:rgba(48,124,224,0.14);color:var(--blue);">${op.sector||'Outros'}</span>${op.alertsEnabled===false?' <span class="de-badge inactive" title="Alertas de dados em falta desativados para este cliente">alertas off</span>':''}</div>
+        <div class="name">${op.name} <span class="de-badge ${op.active?'active':'inactive'}">${op.active?'ativa':'inativa'}</span> <span class="de-badge" style="background:rgba(48,124,224,0.14);color:var(--blue);">${op.sector||'Outros'}</span>${op.alertsEnabled===false?' <span class="de-badge inactive" title="Alertas de dados em falta desativados para este cliente">alertas off</span>':''}${op.usePesos?' <span class="de-badge active" title="Registo de pesos ativo">pesos</span>':''}</div>
         <div class="meta">${fieldCount} campo(s)${entCount ? ' · '+entCount+' '+op.repeating.entityLabel.toLowerCase()+'(s)' : ''}${op.driverField&&op.driverField.enabled?' · campo motorista ativo':''}</div>
       </div>
       <div style="color:var(--blue);font-size:18px;transition:transform .15s;${configExpanded===op.id?'transform:rotate(180deg);':''}">▾</div>
@@ -3726,6 +3715,13 @@ function renderOpEditor(op){
       <div class="de-field">
         <label>Alertas a partir de</label>
         <input type="date" id="op-alerts-from" value="${op.createdFrom || ''}" />
+      </div>
+      <div class="de-field">
+        <label>Registo de pesos (aba Pesos)</label>
+        <select id="op-use-pesos">
+          <option value="1" ${op.usePesos?'selected':''}>Sim</option>
+          <option value="0" ${!op.usePesos?'selected':''}>Não</option>
+        </select>
       </div>
       <button class="de-btn ghost small" id="op-save">Guardar alterações</button>
       <button class="de-btn danger" id="op-delete">Remover operação</button>
@@ -4056,6 +4052,7 @@ function renderOpEditor(op){
     op.active = editor.querySelector('#op-active').value === '1';
     op.alertsEnabled = editor.querySelector('#op-alerts-enabled').value === '1';
     op.createdFrom = editor.querySelector('#op-alerts-from').value || null;
+    op.usePesos = editor.querySelector('#op-use-pesos').value === '1';
     op.workDays = Array.from(editor.querySelectorAll('[data-workday]:checked')).map(cb=>Number(cb.dataset.workday));
     await saveOperations(STATE.operations);
     await logEdit('Atualizou operação', op.name);
@@ -4074,6 +4071,14 @@ function renderOpEditor(op){
     delete STATE.recordsCache[op.id];
     await logEdit('Removeu operação', op.name);
     toast('Operação removida');
+    render();
+  };
+
+  editor.querySelector('#op-use-pesos').onchange = async (e)=>{
+    op.usePesos = e.target.value === '1';
+    await saveOperations(STATE.operations);
+    await logEdit(op.usePesos ? 'Ativou registo de pesos' : 'Desativou registo de pesos', op.name);
+    toast(op.usePesos ? 'Registo de pesos ativado para '+op.name : 'Registo de pesos desativado para '+op.name);
     render();
   };
 
@@ -4192,6 +4197,9 @@ function migrateOperations(ops){
         }
       });
     }
+    if (op.usePesos === undefined){
+      op.usePesos = op.id==='delta_montijo' || /^delta\s+lisboa/i.test(op.name||'');
+    }
     if (!op.workDays){
       op.workDays = op.sector==='Parcel' ? [1,2,3,4,5,6] : [0,1,2,3,4,5,6];
     }
@@ -4299,7 +4307,7 @@ function collectDailyDataForExport(){
 
 function collectPesosDataForExport(){
   const rows = [];
-  (typeof PESOS_OPS !== 'undefined' ? PESOS_OPS : []).forEach(opId=>{
+  pesosOps().forEach(opId=>{
     const op = STATE.operations.find(o=>o.id===opId);
     const entries = STATE.pesosCache[opId] || {};
     Object.keys(entries).sort().forEach(dateKey=>{
@@ -4410,7 +4418,7 @@ async function init(){
     const auditSnap = await db.collection('auditLog').orderBy('ts','desc').limit(300).get();
     STATE.auditLog = auditSnap.docs.map(d=>d.data()).reverse();
 
-    await Promise.all(PESOS_OPS.map(async opId=>{
+    await Promise.all(pesosOps().map(async opId=>{
       const pesosSnap = await db.collection('pesos').doc(opId).get();
       STATE.pesosCache[opId] = pesosSnap.exists ? (pesosSnap.data().entries || {}) : {};
     }));
