@@ -3329,20 +3329,25 @@ function renderPesos(){
   tableCard.className = 'de-card';
   let sumTotal=0, sumB1=0, sumB2=0;
   const today = todayISO();
+  // Encomendas = valor do campo "Encomendas" do Registo (não a contagem de pesos lançados)
+  const sumRecords = STATE.recordsCache[pesosSel.opId] || {};
+  const sumEncField = ((op && op.fields) || []).find(f=>f.role==='total');
   const rowsHtml = monthDates.map(ds=>{
     const weights = entries[ds] || [];
-    const { b1, b2, total } = bucketizeWeights(weights);
+    const { b1, b2, total: nPesos } = bucketizeWeights(weights);
+    const sumRec = sumRecords[ds];
+    const total = (sumEncField && sumRec && !sumRec.noOperation && sumRec.fixed) ? (Number(sumRec.fixed[sumEncField.key])||0) : 0;
     sumTotal += total; sumB1 += b1; sumB2 += b2;
     const d = Number(ds.slice(8,10));
     const isToday = ds === today;
     return `<tr ${isToday?'style="background:var(--row-hover);"':''} data-pesos-day-row="${ds}">
       <td>${String(d).padStart(2,'0')} <span style="color:var(--text-faint);">${weekdayName(ds).slice(0,3)}</span></td>
       <td>${total || '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>${total ? `<span style="color:var(--green);font-weight:700;">${b1}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>${total ? `<span style="color:var(--blue);font-weight:700;">${b2}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
+      <td>${nPesos ? `<span style="color:var(--green);font-weight:700;">${b1}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
+      <td>${nPesos ? `<span style="color:var(--blue);font-weight:700;">${b2}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
       <td>
         <button class="de-btn ghost small" data-pesos-edit="${ds}" type="button">${ICONS.pencil}</button>
-        ${total ? `<button class="de-btn danger" data-pesos-del="${ds}" type="button">${ICONS.trash}</button>` : ''}
+        ${nPesos ? `<button class="de-btn danger" data-pesos-del="${ds}" type="button">${ICONS.trash}</button>` : ''}
       </td>
     </tr>`;
   }).join('');
