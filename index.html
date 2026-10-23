@@ -3323,7 +3323,7 @@ function parseDeltaWorkbook(wb, fileName){
       const iDoc = hdr.findIndex(x=>x.startsWith('doc'));
       const iCli = hdr.findIndex(x=>x==='cliente');
       const iCentro = hdr.findIndex(x=>x==='centro');
-      const byDate = {}; const centros = {};
+      const parsedRows = []; const centros = {};
       let semData = 0, semPeso = 0, duplicados = 0;
       const seenDocs = new Set();
       for (let r=h+1; r<rows.length; r++){
@@ -3338,17 +3338,50 @@ function parseDeltaWorkbook(wb, fileName){
           seenDocs.add(k);
         }
         const data = iData>=0 ? parseDeltaDate(row[iData]) : null;
-        const key = data || '__sem_data__';
         if (!data) semData++;
         if (peso===null) semPeso++;
-        (byDate[key] = byDate[key] || []).push(peso===null ? 0 : peso);
+        parsedRows.push({ data, peso: peso===null ? 0 : peso });
         if (iCentro>=0 && row[iCentro]) { const c = String(row[iCentro]).trim(); centros[c] = (centros[c]||0)+1; }
       }
-      if (!Object.keys(byDate).length) continue;
+      if (!parsedRows.length) continue;
+
+      // ---- Correção do ano ----
+      // A Delta às vezes arrasta a célula da data no Excel e o ano vai subindo
+      // linha a linha (02.10.2026, 02.10.2027, 02.10.2028…). O dia e o mês
+      // estão certos; o ano é forçado para o ano de referência:
+      //  1) o ano da data no nome do ficheiro (ex: "... 01.10.2026.xlsx");
+      //  2) senão, o ano mais frequente nas linhas que esteja perto de hoje;
+      //  3) senão, o ano atual.
+      // Se o ficheiro for de dezembro e a entrega for em janeiro, usa o ano seguinte.
+      const todayY = Number(todayISO().slice(0,4));
+      const fm = String(fileName||'').match(/(\d{2})[._-](\d{2})[._-](\d{4})/);
+      let refYear = null, fileMonth = null;
+      if (fm && Math.abs(Number(fm[3])-todayY) <= 1){ refYear = Number(fm[3]); fileMonth = Number(fm[2]); }
+      if (!refYear){
+        const yc = {};
+        parsedRows.forEach(r=>{ if (r.data){ const y = Number(r.data.slice(0,4)); if (Math.abs(y-todayY)<=1) yc[y]=(yc[y]||0)+1; } });
+        refYear = Number(Object.entries(yc).sort((a,b)=>b[1]-a[1]).map(e=>e[0])[0]) || todayY;
+      }
+      let anosCorrigidos = 0; const exemploCorrecao = [];
+      const byDate = {};
+      parsedRows.forEach(r=>{
+        let key = '__sem_data__';
+        if (r.data){
+          const y = Number(r.data.slice(0,4)), mo = Number(r.data.slice(5,7));
+          const expected = (fileMonth===12 && mo===1) ? refYear+1 : refYear;
+          if (y !== expected){
+            const fixed = expected + r.data.slice(4);
+            if (exemploCorrecao.length<1) exemploCorrecao.push(r.data.split('-').reverse().join('.')+' → '+fixed.split('-').reverse().join('.'));
+            r.data = fixed; anosCorrigidos++;
+          }
+          key = r.data;
+        }
+        (byDate[key] = byDate[key] || []).push(r.peso);
+      });
       // Centro: o mais frequente na coluna; se faltar, tenta pelo nome do ficheiro (ex: "... MRSE ...")
       let centro = Object.entries(centros).sort((a,b)=>b[1]-a[1]).map(e=>e[0])[0] || null;
       if (!centro){ const m = String(fileName||'').match(/\bMR[A-Z]{2}\b/); if (m) centro = m[0]; }
-      return { ok:true, sheet: sheetName, byDate, centro, semData, semPeso, duplicados };
+      return { ok:true, sheet: sheetName, byDate, centro, semData, semPeso, duplicados, anosCorrigidos, exemploCorrecao: exemploCorrecao[0]||'' };
     }
   }
   return { ok:false, error:'Não encontrei nenhuma folha com a coluna "Peso". Confirma que é o ficheiro de processamento de entregas da Delta.' };
@@ -3405,12 +3438,18 @@ function renderPesos(){
     const mismatch = p.centro && tgt && tgt.pesosCentro && tgt.pesosCentro!==p.centro;
     const curEntries = STATE.pesosCache[p.opId] || {};
     const dates = Object.keys(p.byDate).sort();
+    const realDates = dates.filter(d=>d!=='__sem_data__');
+    const mainDate = realDates.slice().sort((a,b)=>p.byDate[b].length-p.byDate[a].length)[0];
     pendingHtml = `
       <div style="border:1px solid var(--blue);border-radius:10px;padding:14px 16px;margin-top:14px;background:var(--blue-glow);">
         <div style="font-weight:700;margin-bottom:4px;">Pré-visualização — ${p.fileName}</div>
         <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">Folha "${p.sheet}"${p.centro?' · centro '+p.centro:''} · vai para <strong>${tgt?tgt.name:p.opId}</strong></div>
         ${(other || mismatch) ? `<div style="border:1px solid var(--red);color:var(--red);border-radius:8px;padding:8px 12px;font-size:12.5px;margin-bottom:10px;">${ICONS.warning} Este ficheiro é do centro <strong>${p.centro}</strong>${other?`, que está associado a <strong>${other.name}</strong>`:''}${mismatch?`, mas ${tgt.name} costuma receber o centro <strong>${tgt.pesosCentro}</strong>`:''}. Confirma a operação antes de guardar.
           ${other?`<button class="de-btn ghost small" id="pesos-switch-target" data-target="${other.id}" style="margin-left:6px;">Importar para ${other.name}</button>`:''}</div>` : ''}
+        ${p.anosCorrigidos ? `<div style="border:1px solid #d99a1c;color:#d99a1c;border-radius:8px;padding:8px 12px;font-size:12.5px;margin-bottom:10px;">${ICONS.warning} O ano da data estava errado em <strong>${p.anosCorrigidos}</strong> linha(s) do ficheiro (ex: ${p.exemploCorrecao}) — foi corrigido automaticamente.</div>` : ''}
+        ${realDates.length>1 ? `<div style="border:1px solid #d99a1c;border-radius:8px;padding:8px 12px;font-size:12.5px;margin-bottom:10px;">${ICONS.warning} O ficheiro tem encomendas em <strong>${realDates.length} datas</strong> diferentes. Normalmente cada ficheiro é de um só dia — se for o caso, junta tudo:
+          <select id="pesos-merge-date" style="background:var(--navy);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px;margin-left:6px;">${realDates.map(d=>`<option value="${d}" ${d===mainDate?'selected':''}>${d.split('-').reverse().join('/')}</option>`).join('')}</select>
+          <button class="de-btn ghost small" id="pesos-merge-btn">Juntar tudo neste dia</button></div>` : ''}
         <table class="de-table">
           <thead><tr><th>Data de entrega</th><th>Encomendas</th><th>0–30kg</th><th>31–60kg</th><th>Peso total</th><th></th></tr></thead>
           <tbody>${dates.map(d=>{
@@ -3558,6 +3597,14 @@ function renderPesos(){
 
   const switchBtn = document.getElementById('pesos-switch-target');
   if (switchBtn) switchBtn.onclick = ()=>{ pesosPending.opId = switchBtn.dataset.target; pesosSel.opId = switchBtn.dataset.target; render(); };
+  const mergeBtn = document.getElementById('pesos-merge-btn');
+  if (mergeBtn) mergeBtn.onclick = ()=>{
+    const target = document.getElementById('pesos-merge-date').value;
+    const all = [];
+    Object.keys(pesosPending.byDate).forEach(d=>{ if (d!=='__sem_data__'){ all.push(...pesosPending.byDate[d]); delete pesosPending.byDate[d]; } });
+    pesosPending.byDate[target] = all;
+    render();
+  };
   const cancelBtn = document.getElementById('pesos-cancel');
   if (cancelBtn) cancelBtn.onclick = ()=>{ pesosPending = null; render(); };
   const confirmBtn = document.getElementById('pesos-confirm');
