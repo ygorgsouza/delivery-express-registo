@@ -2341,7 +2341,7 @@ function computeAllMissingDays(op){
 function renderAnalisesSubtabs(){
   const el = document.createElement('div');
   el.className = 'de-subtabs';
-  [['mensal','Mensal'],['anual','Anual'],['setor','Por Setor'],['cliente','Por Cliente']].forEach(([id,label])=>{
+  [['panorama','Panorama'],['mensal','Mensal'],['anual','Anual'],['setor','Por Setor'],['cliente','Por Cliente']].forEach(([id,label])=>{
     const b = document.createElement('button');
     b.className = 'de-subtab' + (analisesSel.subtab===id?' active':'');
     b.textContent = label;
@@ -2438,14 +2438,344 @@ function renderHeroOverview(){
 function renderAnalises(){
   const body = document.getElementById('de-body');
   const wrap = document.createElement('div');
-  wrap.appendChild(renderHeroOverview());
+  if (analisesSel.subtab!=='panorama') wrap.appendChild(renderHeroOverview());
   wrap.appendChild(renderAnalisesSubtabs());
   body.innerHTML=''; body.appendChild(wrap);
 
   if (analisesSel.subtab==='mensal') renderMensal(wrap);
   else if (analisesSel.subtab==='anual') renderAnual(wrap);
   else if (analisesSel.subtab==='setor') renderPorSetor(wrap);
+  else if (analisesSel.subtab==='panorama') renderPanorama(wrap);
   else renderPorCliente(wrap);
+}
+
+// ---------- PANORAMA DO MÊS (card para partilhar no WhatsApp) ----------
+// Card com logo, KPIs, nível de serviço diário e motivos das não entregues.
+// Funciona para qualquer cliente (campos fixos ou por motorista/região).
+// Exporta como imagem: copiar, descarregar PNG ou partilhar (telemóvel).
+let panSel = { opId:null, year:null, month:null, hideZero:true };
+
+function panLoadHidden(opId){ try { return JSON.parse(localStorage.getItem('de-pan-hidden-'+opId)||'[]'); } catch(e){ return []; } }
+function panSaveHidden(opId, arr){ try { localStorage.setItem('de-pan-hidden-'+opId, JSON.stringify(arr)); } catch(e){} }
+
+// Campos "motivo/outros" (sem papel), sem quilómetros. Um campo por chave.
+function panMotivoFields(op){
+  const out = [], seen = new Set();
+  const add = f => { if (!f || f.role || seen.has(f.key) || /\bkms?\b|quil/i.test(f.label+' '+f.key)) return; seen.add(f.key); out.push({key:f.key, label:f.label}); };
+  (op.fields||[]).forEach(add);
+  if (op.repeating) op.repeating.fields.forEach(add);
+  return out;
+}
+// Valor de um campo num dia: soma das entidades se houver; senão o campo fixo
+function panFieldVal(op, rec, key){
+  if (!rec) return 0;
+  let s = 0, has = false;
+  Object.values(rec.entities||{}).forEach(ev=>{ if (ev && ev[key]!==undefined && ev[key]!==''){ s += Number(ev[key])||0; has = true; } });
+  if (has) return s;
+  return Number(rec.fixed && rec.fixed[key]) || 0;
+}
+function panLevelColor(edr){
+  if (edr===null || edr===undefined) return { bg:'#f1f3f7', fg:'#8a91a1' };
+  if (edr >= 0.95) return { bg:'#dcf5e7', fg:'#0a7d48' };
+  if (edr >= 0.90) return { bg:'#fdf0d5', fg:'#a86b00' };
+  return { bg:'#fde2e3', fg:'#c3262d' };
+}
+function panComputeMonth(op, year, month){
+  const records = STATE.recordsCache[op.id] || {};
+  const lastDay = daysInMonth(year, month);
+  const t = todayISO();
+  const isCurrent = year===Number(t.slice(0,4)) && month===Number(t.slice(5,7));
+  let upTo = isCurrent ? Number(t.slice(8,10)) : lastDay;
+  // O dia de hoje só entra no panorama quando já tiver registo
+  if (isCurrent && upTo>1 && !records[t]) upTo -= 1;
+  const motivos = panMotivoFields(op);
+  const hasNaoField = (op.fields||[]).concat(op.repeating?op.repeating.fields:[]).some(f=>f.role==='nao_entregues');
+  const days = []; const tot = { ent:0, nao:0, total:0, dias:0, mot:{} };
+  motivos.forEach(m=>tot.mot[m.key]=0);
+  const summary = Object.values(records).find(r=>r && r.monthlySummary && r.summaryMonth===year+'-'+String(month).padStart(2,'0'));
+  for (let d=1; d<=upTo; d++){
+    const ds = year+'-'+String(month).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    const rec = records[ds];
+    const dow = new Date(ds+'T00:00:00').getDay();
+    const row = { d, ds, dow, status:'vazio', ent:0, nao:0, total:0, edr:null, mot:{} };
+    if (rec && rec.noOperation) row.status = 'semop';
+    else if (rec && !rec.monthlySummary){
+      const ent = dayEntregues(op, rec), total = dayTotal(op, rec);
+      const nao = hasNaoField ? sumRoleForDate(op, rec, 'nao_entregues') : Math.max(0, total-ent);
+      if (ent || total || nao){
+        row.status = 'ok'; row.ent = ent; row.nao = nao; row.total = total; row.edr = total>0 ? ent/total : null;
+        motivos.forEach(m=>{ const v = panFieldVal(op, rec, m.key); row.mot[m.key] = v; tot.mot[m.key] += v; });
+        tot.ent += ent; tot.nao += nao; tot.total += total; tot.dias++;
+      }
+    }
+    days.push(row);
+  }
+  if (summary && !tot.dias){ // mês registado só como total mensal
+    tot.ent = dayEntregues(op, summary); tot.total = dayTotal(op, summary);
+    tot.nao = hasNaoField ? sumRoleForDate(op, summary, 'nao_entregues') : Math.max(0, tot.total-tot.ent);
+    motivos.forEach(m=>tot.mot[m.key] = panFieldVal(op, summary, m.key));
+  }
+  tot.edr = tot.total>0 ? tot.ent/tot.total : null;
+  return { days, tot, motivos, isCurrent, upTo, lastDay, onlySummary: !!(summary && !tot.dias) };
+}
+
+function pctPT(v){ return (v===null||v===undefined||isNaN(v)) ? '—' : (v*100).toFixed(2).replace('.',',')+'%'; }
+function panLogoSrc(){
+  const img = document.querySelector('#de-app-root .logo-chip img');
+  return img ? img.src : '';
+}
+
+function renderPanorama(wrap){
+  const ops = STATE.operations.slice().sort((a,b)=>(b.active-a.active)||a.name.localeCompare(b.name));
+  if (!panSel.opId || !ops.some(o=>o.id===panSel.opId)){
+    panSel.opId = (analisesSel.opId && analisesSel.opId!=='all' && ops.some(o=>o.id===analisesSel.opId)) ? analisesSel.opId : (ops.find(o=>o.active)||ops[0]).id;
+  }
+  if (!panSel.year) panSel.year = Number(todayISO().slice(0,4));
+  if (!panSel.month) panSel.month = Number(todayISO().slice(5,7));
+  const op = STATE.operations.find(o=>o.id===panSel.opId);
+
+  const controls = document.createElement('div');
+  controls.className = 'de-row';
+  controls.innerHTML = `
+    <div class="de-field"><label>Cliente</label><select id="pan-op">${ops.map(o=>`<option value="${o.id}" ${o.id===panSel.opId?'selected':''}>${o.name}${o.active?'':' (inativa)'}</option>`).join('')}</select></div>
+    <div class="de-field"><label>Mês</label><select id="pan-month">${[1,2,3,4,5,6,7,8,9,10,11,12].map(m=>`<option value="${m}" ${m===panSel.month?'selected':''}>${monthName(m)}</option>`).join('')}</select></div>
+    <div class="de-field"><label>Ano</label><select id="pan-year">${sectorYearOptions().map(y=>`<option value="${y}" ${y===panSel.year?'selected':''}>${y}</option>`).join('')}</select></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;">
+      <button class="de-btn" id="pan-copy">${ICONS.repeat} Copiar imagem</button>
+      <button class="de-btn ghost" id="pan-share">${ICONS.upload} Partilhar</button>
+      <button class="de-btn ghost" id="pan-download">${ICONS.download} PNG</button>
+    </div>
+  `;
+  wrap.appendChild(controls);
+
+  const data = panComputeMonth(op, panSel.year, panSel.month);
+  const hidden = new Set(panLoadHidden(op.id));
+  const motivosVis = data.motivos.filter(m=>!hidden.has(m.key) && !(panSel.hideZero && !data.tot.mot[m.key]));
+
+  // Escolha de colunas (interativo; não aparece na imagem)
+  const colBar = document.createElement('div');
+  colBar.className = 'de-card';
+  colBar.style.padding = '12px 16px';
+  colBar.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-faint);font-weight:700;">Colunas de motivos</span>
+      ${data.motivos.length ? data.motivos.map(m=>{
+        const on = !hidden.has(m.key);
+        const zero = !data.tot.mot[m.key];
+        return `<button class="de-subtab ${on && !(panSel.hideZero&&zero)?'active':''}" data-pan-col="${m.key}" title="${zero?'Sem ocorrências neste mês':data.tot.mot[m.key]+' no mês'}" style="padding:5px 12px;${zero&&panSel.hideZero?'opacity:.5;':''}">${m.label}${zero?'':' · '+data.tot.mot[m.key]}</button>`;
+      }).join('') : '<span style="font-size:12px;color:var(--text-faint);">Este cliente não tem campos de motivos no Registo.</span>'}
+      <label style="margin-left:auto;font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" id="pan-hidezero" ${panSel.hideZero?'checked':''}/> Ocultar motivos sem ocorrências</label>
+    </div>`;
+  wrap.appendChild(colBar);
+
+  // ---------- O CARD ----------
+  const scroller = document.createElement('div');
+  scroller.style.cssText = 'overflow-x:auto;padding-bottom:6px;';
+  const card = document.createElement('div');
+  card.id = 'pan-card';
+  const C = { navy:'#0d1b3e', navy2:'#16295a', blue:'#3b6fe0', ink:'#12141c', dim:'#5f6676', faint:'#9aa1b0', line:'#e7eaf0', zebra:'#f7f9fc', weekend:'#fff4ec' };
+  const edrTot = data.tot.edr;
+  const lvl = panLevelColor(edrTot);
+  const monthLabel = monthName(panSel.month)+' '+panSel.year;
+  const geradoEm = new Date().toLocaleString('pt-PT',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+  const diasSemana = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+  const mediaDia = data.tot.dias ? data.tot.ent/data.tot.dias : null;
+  const motTotais = data.motivos.map(m=>({ ...m, v:data.tot.mot[m.key] })).filter(m=>m.v>0).sort((a,b)=>b.v-a.v);
+  const motMax = motTotais.length ? motTotais[0].v : 1;
+  const motSoma = motTotais.reduce((a,m)=>a+m.v,0);
+  const barColors = ['#3b6fe0','#e5484d','#f5a524','#8b5cf6','#14b8a6','#ec4899','#64748b','#0ea5e9','#84cc16','#f97316'];
+
+  // Gráfico de nível de serviço por dia (SVG)
+  const W = 1000-64, H = 120, padL = 30, padB = 18;
+  const bw = (W-padL)/Math.max(data.days.length,1);
+  const minScale = 0.80;
+  const yOf = v => (H-padB) - Math.max(0,(v-minScale)/(1-minScale))*(H-padB-8);
+  const svgBars = data.days.map((r,i)=>{
+    const x = padL + i*bw + bw*0.18, w = bw*0.64;
+    if (r.status!=='ok' || r.edr===null) return `<rect x="${x}" y="${H-padB-2}" width="${w}" height="2" rx="1" fill="#d5d9e2"/><text x="${x+w/2}" y="${H-4}" font-size="9" text-anchor="middle" fill="${C.faint}">${r.d}</text>`;
+    const col = panLevelColor(r.edr).fg;
+    const y = yOf(r.edr);
+    return `<rect x="${x}" y="${y}" width="${w}" height="${H-padB-y}" rx="3" fill="${col}" opacity="0.88"><title>${r.d}/${panSel.month}: ${pctPT(r.edr)}</title></rect><text x="${x+w/2}" y="${H-4}" font-size="9" text-anchor="middle" fill="${C.dim}">${r.d}</text>`;
+  }).join('');
+  const gridLines = [0.8,0.9,0.95,1].map(v=>`<line x1="${padL}" x2="${W}" y1="${yOf(v)}" y2="${yOf(v)}" stroke="${v===0.95?'#9fd9b9':'#eceff4'}" stroke-dasharray="${v===0.95?'4 3':''}"/><text x="${padL-6}" y="${yOf(v)+3}" font-size="9" text-anchor="end" fill="${C.faint}">${Math.round(v*100)}%</text>`).join('');
+
+  const th = (t, extra='') => `<th style="padding:9px 8px;font-size:10.5px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#fff;text-align:center;white-space:nowrap;${extra}">${t}</th>`;
+  const rowsHtml = data.days.map((r,i)=>{
+    const weekend = r.dow===0 || r.dow===6;
+    const bg = weekend ? C.weekend : (i%2 ? C.zebra : '#fff');
+    const cell = (v, opt={}) => `<td style="padding:7px 8px;text-align:center;font-size:12.5px;${opt.style||''}">${v}</td>`;
+    if (r.status!=='ok'){
+      const label = r.status==='semop' ? 'Sem operação' : 'Sem registo';
+      return `<tr style="background:${bg};" data-pan-day="${r.ds}">${cell(r.d,{style:'font-weight:800;color:'+C.ink})}${cell(diasSemana[r.dow],{style:'color:'+C.dim+';text-align:left'})}<td colspan="${4+motivosVis.length}" style="padding:7px 10px;font-size:11.5px;color:${C.faint};font-style:italic;">${label}</td></tr>`;
+    }
+    const lv = panLevelColor(r.edr);
+    const motCells = motivosVis.map(m=>{
+      const v = r.mot[m.key]||0;
+      return cell(v ? `<span style="display:inline-block;min-width:24px;padding:2px 7px;border-radius:10px;background:#fde9ea;color:#c3262d;font-weight:800;">${v}</span>` : `<span style="color:#c9ced8;">0</span>`);
+    }).join('');
+    return `<tr style="background:${bg};cursor:pointer;" data-pan-day="${r.ds}">
+      ${cell(r.d,{style:'font-weight:800;color:'+C.ink})}
+      ${cell(diasSemana[r.dow],{style:'color:'+C.dim+';text-align:left'})}
+      ${cell(fmt(r.ent),{style:'font-weight:800;color:'+C.ink})}
+      ${cell(r.nao ? `<span style="color:#c3262d;font-weight:800;">${fmt(r.nao)}</span>` : '<span style="color:#c9ced8;">0</span>')}
+      ${motCells}
+      ${cell(fmt(r.total),{style:'color:'+C.dim+';font-weight:700'})}
+      ${cell(`<span style="display:inline-block;min-width:64px;padding:3px 8px;border-radius:8px;background:${lv.bg};color:${lv.fg};font-weight:800;font-family:'JetBrains Mono',monospace;font-size:12px;">${r.edr!==null?pctPT(r.edr):'—'}</span>`)}
+    </tr>`;
+  }).join('');
+
+  const kpi = (label, value, sub, color) => `
+    <div style="flex:1;min-width:150px;background:#fff;border:1px solid ${C.line};border-radius:14px;padding:14px 16px;box-shadow:0 2px 8px rgba(13,27,62,.05);">
+      <div style="font-size:10.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:${C.faint};">${label}</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:28px;font-weight:800;color:${color||C.ink};margin-top:6px;letter-spacing:-.02em;">${value}</div>
+      ${sub?`<div style="font-size:11px;color:${C.dim};margin-top:3px;">${sub}</div>`:''}
+    </div>`;
+
+  card.style.cssText = `width:1000px;background:#f4f6fa;border-radius:20px;overflow:hidden;font-family:Inter,-apple-system,sans-serif;color:${C.ink};box-shadow:0 16px 40px rgba(0,0,0,.25);margin:0 auto;`;
+  card.innerHTML = `
+    <div style="background:radial-gradient(ellipse at top right, rgba(59,111,224,.45), transparent 60%), linear-gradient(135deg, ${C.navy}, ${C.navy2});padding:24px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;">
+      <div style="display:flex;align-items:center;gap:18px;">
+        <div style="background:#fff;border-radius:12px;padding:8px 14px;height:64px;display:flex;align-items:center;box-shadow:0 0 0 4px rgba(255,255,255,.12);">
+          ${panLogoSrc()?`<img src="${panLogoSrc()}" style="height:48px;width:auto;display:block;" />`:'<strong style="color:'+C.navy+'">Delivery Express</strong>'}
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:800;letter-spacing:.16em;color:#8fb0ff;text-transform:uppercase;">Panorama operacional</div>
+          <div style="font-size:26px;font-weight:900;color:#fff;letter-spacing:-.01em;margin-top:2px;">${op.name}</div>
+        </div>
+      </div>
+      <div style="text-align:right;">
+        <div style="display:inline-block;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22);color:#fff;border-radius:999px;padding:7px 16px;font-weight:800;font-size:14px;">${monthLabel}</div>
+        <div style="font-size:11px;color:#b9c6e6;margin-top:8px;">${data.isCurrent?'Dados até '+String(data.upTo).padStart(2,'0')+'/'+String(panSel.month).padStart(2,'0')+' · ':''}Atualizado ${geradoEm}</div>
+      </div>
+    </div>
+
+    <div style="padding:22px 32px 6px;display:flex;gap:12px;flex-wrap:wrap;">
+      ${kpi('Nível de serviço', edrTot!==null?pctPT(edrTot):'—', 'Entregues ÷ total do mês', lvl.fg)}
+      ${kpi('Entregues', fmt(data.tot.ent), mediaDia!==null?'Média '+(Math.round(mediaDia*10)/10).toLocaleString('pt-PT')+' / dia':'', C.ink)}
+      ${kpi('Não entregues', fmt(data.tot.nao), data.tot.total?pctPT(data.tot.nao/data.tot.total)+' do total':'', data.tot.nao?'#c3262d':C.ink)}
+      ${kpi('Total', fmt(data.tot.total), data.tot.dias+' dia(s) com operação', C.ink)}
+    </div>
+
+    ${data.onlySummary ? `<div style="margin:12px 32px;padding:12px 16px;background:#fff;border:1px solid ${C.line};border-radius:12px;font-size:12.5px;color:${C.dim};">Este mês foi registado apenas como total mensal (sem detalhe diário).</div>` : `
+    <div style="margin:16px 32px 0;background:#fff;border:1px solid ${C.line};border-radius:14px;padding:14px 16px 8px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <div style="font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:${C.blue};">Nível de serviço por dia</div>
+        <div style="display:flex;gap:12px;font-size:10.5px;color:${C.dim};">
+          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#0a7d48;margin-right:4px;"></span>≥ 95%</span>
+          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#a86b00;margin-right:4px;"></span>90–95%</span>
+          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#c3262d;margin-right:4px;"></span>&lt; 90%</span>
+        </div>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;">${gridLines}${svgBars}</svg>
+    </div>`}
+
+    <div style="margin:16px 32px 0;display:flex;gap:16px;align-items:stretch;">
+      <div style="flex:1;background:#fff;border:1px solid ${C.line};border-radius:14px;padding:16px 18px;">
+        <div style="font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:${C.blue};margin-bottom:12px;">Motivos das não entregues · mês</div>
+        ${motTotais.length ? motTotais.map((m,i)=>`
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:9px;">
+            <div style="width:150px;font-size:12.5px;font-weight:700;color:${C.ink};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${m.label}</div>
+            <div style="flex:1;height:14px;background:#eef1f6;border-radius:7px;overflow:hidden;"><div style="width:${Math.max(3,m.v/motMax*100)}%;height:100%;background:${barColors[i%barColors.length]};border-radius:7px;"></div></div>
+            <div style="width:90px;text-align:right;font-family:'JetBrains Mono',monospace;font-size:12.5px;font-weight:800;">${m.v} <span style="color:${C.faint};font-weight:600;">${motSoma?Math.round(m.v/motSoma*100)+'%':''}</span></div>
+          </div>`).join('') : `<div style="font-size:13px;color:${C.dim};padding:8px 0;">Sem motivos registados neste mês. ${data.tot.nao?'':'🎯'}</div>`}
+      </div>
+      <div style="width:250px;background:linear-gradient(160deg, ${lvl.bg}, #fff);border:1px solid ${C.line};border-radius:14px;padding:16px 18px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;">
+        <div style="font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:${C.dim};">Resultado do mês</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:42px;font-weight:900;color:${lvl.fg};margin:6px 0;letter-spacing:-.03em;">${edrTot!==null?pctPT(edrTot):'—'}</div>
+        <div style="font-size:12px;color:${C.dim};">${fmt(data.tot.ent)} de ${fmt(data.tot.total)} encomendas entregues</div>
+      </div>
+    </div>
+
+    ${data.onlySummary ? '' : `
+    <div style="margin:16px 32px 0;background:#fff;border:1px solid ${C.line};border-radius:14px;overflow:hidden;">
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="background:linear-gradient(135deg, ${C.navy}, ${C.navy2});">
+          ${th('Dia')}${th('Dia semana','text-align:left;')}${th('Entregues')}${th('Não entregues')}${motivosVis.map(m=>th(m.label)).join('')}${th('Total dia')}${th('Nível serviço')}
+        </tr></thead>
+        <tbody>${rowsHtml}</tbody>
+        <tfoot><tr style="background:#eaf0fd;border-top:2px solid ${C.blue};">
+          <td colspan="2" style="padding:10px 8px;font-size:12px;font-weight:900;color:${C.navy};letter-spacing:.04em;">TOTAL ${monthName(panSel.month).slice(0,3).toUpperCase()}</td>
+          <td style="padding:10px 8px;text-align:center;font-weight:900;font-size:13px;">${fmt(data.tot.ent)}</td>
+          <td style="padding:10px 8px;text-align:center;font-weight:900;font-size:13px;color:#c3262d;">${fmt(data.tot.nao)}</td>
+          ${motivosVis.map(m=>`<td style="padding:10px 8px;text-align:center;font-weight:900;font-size:13px;">${data.tot.mot[m.key]||0}</td>`).join('')}
+          <td style="padding:10px 8px;text-align:center;font-weight:900;font-size:13px;">${fmt(data.tot.total)}</td>
+          <td style="padding:10px 8px;text-align:center;"><span style="display:inline-block;min-width:64px;padding:4px 8px;border-radius:8px;background:${lvl.bg};color:${lvl.fg};font-weight:900;font-family:'JetBrains Mono',monospace;font-size:12.5px;">${edrTot!==null?pctPT(edrTot):'—'}</span></td>
+        </tr></tfoot>
+      </table>
+    </div>`}
+
+    <div style="padding:16px 32px 20px;display:flex;justify-content:space-between;align-items:center;font-size:10.5px;color:${C.faint};">
+      <span>Nível de serviço = entregues ÷ total do dia · fins de semana a laranja</span>
+      <span style="font-weight:800;letter-spacing:.08em;color:${C.dim};">DELIVERY EXPRESS · REGISTO OPERACIONAL</span>
+    </div>
+  `;
+  scroller.appendChild(card);
+  wrap.appendChild(scroller);
+
+  // ---------- interações ----------
+  controls.querySelector('#pan-op').onchange = e=>{ panSel.opId = e.target.value; render(); };
+  controls.querySelector('#pan-month').onchange = e=>{ panSel.month = Number(e.target.value); render(); };
+  controls.querySelector('#pan-year').onchange = e=>{ panSel.year = Number(e.target.value); render(); };
+  colBar.querySelector('#pan-hidezero') && (colBar.querySelector('#pan-hidezero').onchange = e=>{ panSel.hideZero = e.target.checked; render(); });
+  colBar.querySelectorAll('[data-pan-col]').forEach(b=>{
+    b.onclick = ()=>{
+      const k = b.dataset.panCol, arr = panLoadHidden(op.id);
+      const i = arr.indexOf(k);
+      if (i>=0) arr.splice(i,1); else arr.push(k);
+      if (panSel.hideZero && !data.tot.mot[k]) panSel.hideZero = false; // mostrar mesmo a zero
+      panSaveHidden(op.id, arr); render();
+    };
+  });
+  card.querySelectorAll('[data-pan-day]').forEach(tr=>{
+    tr.title = 'Clica para abrir este dia no Registo';
+    tr.onmouseenter = ()=>{ tr.dataset.bg = tr.style.background; tr.style.background = '#e8effd'; };
+    tr.onmouseleave = ()=>{ tr.style.background = tr.dataset.bg || ''; };
+    tr.onclick = ()=>{ registoSel.opId = op.id; registoSel.date = tr.dataset.panDay; STATE.tab='registo'; render(); };
+  });
+
+  const fileName = `Panorama-${slug(op.name)}-${panSel.year}-${String(panSel.month).padStart(2,'0')}.png`;
+  async function makeBlob(){
+    await panEnsureHtml2Canvas();
+    const canvas = await html2canvas(card, { scale:2, backgroundColor:null, useCORS:true, logging:false });
+    return await new Promise(res=>canvas.toBlob(res, 'image/png'));
+  }
+  async function withBusy(btn, fn){
+    const old = btn.innerHTML; btn.disabled = true; btn.textContent = 'A gerar…';
+    try { await fn(); } catch(e){ console.error(e); toast(ICONS.warning+' Não foi possível gerar a imagem'); }
+    btn.disabled = false; btn.innerHTML = old;
+  }
+  function downloadBlob(blob){
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fileName; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+  }
+  controls.querySelector('#pan-copy').onclick = e=>withBusy(e.currentTarget, async ()=>{
+    const blob = await makeBlob();
+    if (navigator.clipboard && window.ClipboardItem){
+      try { await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]); toast(ICONS.check+' Imagem copiada — cola no WhatsApp (Ctrl+V)'); return; } catch(err){ console.warn(err); }
+    }
+    downloadBlob(blob); toast('Este navegador não deixa copiar imagens — foi descarregada como PNG');
+  });
+  controls.querySelector('#pan-download').onclick = e=>withBusy(e.currentTarget, async ()=>{ downloadBlob(await makeBlob()); toast(ICONS.download+' Imagem descarregada'); });
+  controls.querySelector('#pan-share').onclick = e=>withBusy(e.currentTarget, async ()=>{
+    const blob = await makeBlob();
+    const file = new File([blob], fileName, { type:'image/png' });
+    if (navigator.canShare && navigator.canShare({ files:[file] })){
+      try { await navigator.share({ files:[file], title: op.name+' — '+monthLabel }); } catch(err){ if (err.name!=='AbortError') throw err; }
+    } else { downloadBlob(blob); toast('Partilha direta só no telemóvel — imagem descarregada'); }
+  });
+}
+
+let _h2cPromise = null;
+function panEnsureHtml2Canvas(){
+  if (window.html2canvas) return Promise.resolve();
+  if (_h2cPromise) return _h2cPromise;
+  _h2cPromise = new Promise((resolve, reject)=>{
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+    s.onload = ()=>resolve(); s.onerror = ()=>{ _h2cPromise = null; reject(new Error('html2canvas')); };
+    document.head.appendChild(s);
+  });
+  return _h2cPromise;
 }
 
 // ---------- MENSAL ----------
