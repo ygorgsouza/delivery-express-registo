@@ -3596,7 +3596,10 @@ function renderPesos(){
   tableCard.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
       <h3 style="margin:0;">Faturação — ${opName} · ${monthName(month)} ${year}</h3>
-      <button class="de-btn ghost small" id="pesos-export">${ICONS.download} Exportar faturação do mês (Excel)</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="de-btn small" id="pesos-mapa-delta">${ICONS.download} Mapa de faturação Delta (${monthName(month)})</button>
+        <button class="de-btn ghost small" id="pesos-export">${ICONS.download} Detalhe do mês (Excel)</button>
+      </div>
     </div>
     <div class="de-kpis" style="margin-bottom:14px;">
       <div class="de-kpi"><div class="label">Total a faturar</div><div class="value">${sum.fat}</div></div>
@@ -3785,6 +3788,43 @@ function renderPesos(){
     XLSX.utils.book_append_sheet(wbOut, wsR, 'Resumo');
     wbOut.SheetNames.unshift(wbOut.SheetNames.pop());
     XLSX.writeFile(wbOut, `faturacao-pesos-${pesosSel.date.slice(0,7)}.xlsx`);
+  };
+
+  // Mapa simples para faturar à Delta: dia 1..31 × Abrunheira | Montijo 30kg/60kg | Lisboa 30kg/60kg
+  document.getElementById('pesos-mapa-delta').onclick = ()=>{
+    const findOp = re => STATE.operations.find(o=>re.test(o.name||'') && /delta/i.test(o.name||'')) || STATE.operations.find(o=>re.test(o.name||''));
+    const opAbr = findOp(/abrunheira/i), opMon = findOp(/montijo/i), opLis = findOp(/lisboa/i);
+    const nDias = daysInMonth(year, month);
+    const aoa = [
+      ['', 'Abrunheira', 'Montijo', '', 'Lisboa', ''],
+      ['', '', '30 kg', '60kg', '30 kg', '60kg']
+    ];
+    const tot = [0,0,0,0,0];
+    const v = n => n ? n : '';
+    for (let d=1; d<=31; d++){
+      if (d>nDias){ aoa.push([d,'','','','','']); continue; }
+      const ds = year+'-'+String(month).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+      let abr = 0;
+      if (opAbr){
+        if (opAbr.usePesos){ abr = faturacaoDoDia(opAbr.id, ds).totalFat; }
+        else { abr = encomendasRegisto(opAbr.id, ds) || 0; }
+      }
+      const m = opMon ? faturacaoDoDia(opMon.id, ds) : { b1Fat:0, b2:0 };
+      const l = opLis ? faturacaoDoDia(opLis.id, ds) : { b1Fat:0, b2:0 };
+      const row = [abr, m.b1Fat, m.b2, l.b1Fat, l.b2];
+      row.forEach((x,i)=>tot[i]+=x);
+      aoa.push([d, ...row.map(v)]);
+    }
+    aoa.push(['TOTAL', ...tot]);
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!merges'] = [ { s:{r:0,c:2}, e:{r:0,c:3} }, { s:{r:0,c:4}, e:{r:0,c:5} }, { s:{r:0,c:1}, e:{r:1,c:1} } ];
+    ws['!cols'] = [{wch:8},{wch:12},{wch:10},{wch:10},{wch:10},{wch:10}];
+    const wbOut = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wbOut, ws, (monthName(month)+' '+year).slice(0,31));
+    XLSX.writeFile(wbOut, `Faturacao-Delta-${year}-${String(month).padStart(2,'0')}.xlsx`);
+    const faltam = [!opMon&&'Montijo', !opLis&&'Lisboa'].filter(Boolean);
+    toast(ICONS.download+' Mapa exportado'+(faltam.length?' — sem operação encontrada para: '+faltam.join(', '):''));
+    logEdit('Exportou mapa de faturação Delta', monthName(month)+' '+year+' — Montijo '+tot[1]+'/'+tot[2]+' · Lisboa '+tot[3]+'/'+tot[4]);
   };
 
   wrap.querySelectorAll('[data-reent-edit]').forEach(btn=>{
