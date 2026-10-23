@@ -2478,9 +2478,10 @@ function panFieldVal(op, rec, key, entityFilter){
 function panIsExcluido(m){ return /anulad/i.test((m.label||'')+' '+(m.key||'')); }
 function panLevelColor(edr){
   if (edr===null || edr===undefined) return { bg:'#f1f3f7', fg:'#8a91a1' };
-  if (edr >= 0.95) return { bg:'#dcf5e7', fg:'#0a7d48' };
-  if (edr >= 0.90) return { bg:'#fdf0d5', fg:'#a86b00' };
-  return { bg:'#fde2e3', fg:'#c3262d' };
+  // Nível de serviço: ≥ 99% verde · 98–99% amarelo · < 98% vermelho
+  if (edr >= 0.99) return { bg:'#dcf5e7', fg:'#0a7d48', bar:'#16a34a' };
+  if (edr >= 0.98) return { bg:'#fef3c7', fg:'#a16207', bar:'#eab308' };
+  return { bg:'#fde2e3', fg:'#c3262d', bar:'#dc2626' };
 }
 function panComputeMonth(op, year, month, ef){
   const records = STATE.recordsCache[op.id] || {};
@@ -2621,16 +2622,18 @@ function renderPanorama(wrap){
   // Gráfico de nível de serviço por dia (SVG)
   const W = CARD_W-64, H = 120, padL = 30, padB = 18;
   const bw = (W-padL)/Math.max(data.days.length,1);
-  const minScale = 0.80;
+  const minScale = 0.90;
   const yOf = v => (H-padB) - Math.max(0,(v-minScale)/(1-minScale))*(H-padB-8);
   const svgBars = data.days.map((r,i)=>{
     const x = padL + i*bw + bw*0.18, w = bw*0.64;
     if (r.status!=='ok' || r.edr===null) return `<rect x="${x}" y="${H-padB-2}" width="${w}" height="2" rx="1" fill="#d5d9e2"/><text x="${x+w/2}" y="${H-4}" font-size="9" text-anchor="middle" fill="${C.faint}">${r.d}</text>`;
-    const col = panLevelColor(r.edr).fg;
-    const y = yOf(r.edr);
+    const col = panLevelColor(r.edr).bar;
+    const y = Math.min(yOf(r.edr), H-padB-3); // abaixo de 90% fica uma barra mínima, a vermelho
     return `<rect x="${x}" y="${y}" width="${w}" height="${H-padB-y}" rx="3" fill="${col}" opacity="0.88"><title>${r.d}/${panSel.month}: ${pctPT(r.edr)}</title></rect><text x="${x+w/2}" y="${H-4}" font-size="9" text-anchor="middle" fill="${C.dim}">${r.d}</text>`;
   }).join('');
-  const gridLines = [0.8,0.9,0.95,1].map(v=>`<line x1="${padL}" x2="${W}" y1="${yOf(v)}" y2="${yOf(v)}" stroke="${v===0.95?'#9fd9b9':'#eceff4'}" stroke-dasharray="${v===0.95?'4 3':''}"/><text x="${padL-6}" y="${yOf(v)+3}" font-size="9" text-anchor="end" fill="${C.faint}">${Math.round(v*100)}%</text>`).join('');
+  const gridLines = [0.90,0.95,1].map(v=>`<line x1="${padL}" x2="${W}" y1="${yOf(v)}" y2="${yOf(v)}" stroke="#eceff4"/><text x="${padL-6}" y="${yOf(v)+3}" font-size="9" text-anchor="end" fill="${C.faint}">${Math.round(v*100)}%</text>`).join('')
+    + `<line x1="${padL}" x2="${W}" y1="${yOf(0.98)}" y2="${yOf(0.98)}" stroke="#e7c35a" stroke-dasharray="4 3"/>`
+    + `<line x1="${padL}" x2="${W}" y1="${yOf(0.99)}" y2="${yOf(0.99)}" stroke="#7fcf9f" stroke-dasharray="4 3"/>`;
 
   const th = (t, extra='') => `<th style="padding:9px 6px;font-size:10px;font-weight:800;letter-spacing:.03em;text-transform:uppercase;color:#fff;text-align:center;line-height:1.25;vertical-align:middle;${extra}">${t}</th>`;
   const rowsHtml = data.days.map((r,i)=>{
@@ -2695,9 +2698,9 @@ function renderPanorama(wrap){
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
         <div style="font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:${C.blue};">Nível de serviço por dia</div>
         <div style="display:flex;gap:12px;font-size:10.5px;color:${C.dim};">
-          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#0a7d48;margin-right:4px;"></span>≥ 95%</span>
-          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#a86b00;margin-right:4px;"></span>90–95%</span>
-          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#c3262d;margin-right:4px;"></span>&lt; 90%</span>
+          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#16a34a;margin-right:4px;"></span>≥ 99%</span>
+          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#eab308;margin-right:4px;"></span>98–99%</span>
+          <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#dc2626;margin-right:4px;"></span>&lt; 98%</span>
         </div>
       </div>
       <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;">${gridLines}${svgBars}</svg>
