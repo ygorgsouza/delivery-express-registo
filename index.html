@@ -118,7 +118,10 @@
 
   .de-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 18px; }
   .de-field { display: flex; flex-direction: column; gap: 6px; min-width: 170px; }
-  .de-field label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); font-weight: 600; display: flex; align-items: center; gap: 5px; }
+  .de-field { min-width: 0; }
+  .de-field label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 5px; line-height: 1.3; min-height: 15px; }
+  .de-auto-chip { display:inline-flex; align-items:center; padding:1px 7px; border-radius:20px; background: var(--blue-glow); color: var(--blue); font-size:9.5px; font-weight:800; letter-spacing:.04em; white-space:nowrap; }
+  .de-derived-box { font-family: var(--font-mono); font-size: 20px; font-weight: 800; color: var(--green); padding: 4px 12px; border-radius: 7px; border: 1px dashed var(--border); background: var(--panel); min-height: 39px; display:flex; align-items:center; }
   .de-rename-btn {
     background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 11px;
     padding: 0; line-height: 1; opacity: 0.6; transition: opacity .15s, color .15s;
@@ -136,7 +139,9 @@
     background: linear-gradient(135deg, var(--blue), var(--blue-dim)); color: #fff; border: none; padding: 10px 18px;
     border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; font-family: var(--font-ui);
     transition: all .15s; box-shadow: 0 3px 10px rgba(59,111,224,0.25);
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; line-height: 1.2; white-space: nowrap;
   }
+  .de-btn svg, .de-status svg, .de-tab svg, .de-subtab svg { vertical-align: middle !important; flex: none; }
   .de-btn:hover { transform: translateY(-1px); box-shadow: 0 5px 16px rgba(59,111,224,0.35); }
   .de-btn.ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border); font-weight: 600; box-shadow: none; }
   .de-btn.ghost:hover { color: var(--text); border-color: var(--blue-dim); transform: none; box-shadow: none; }
@@ -161,12 +166,15 @@
     content: ''; width: 3px; height: 13px; background: var(--blue); border-radius: 2px; display: inline-block;
   }
 
-  .de-status { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; font-family: var(--font-mono); }
+  .de-status { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; font-family: var(--font-mono); display: inline-flex; align-items: center; gap: 6px; line-height: 1.3; }
+  .de-tab, .de-subtab { display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+  #reg-status-holder { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  #reg-status-holder .de-btn { margin-left: 0 !important; }
   .de-status.new { background: var(--blue-glow); color: var(--blue); }
   .de-status.saved { background: rgba(56,199,147,0.14); color: var(--green); }
   .de-status.inactive { background: rgba(239,90,111,0.12); color: var(--red); }
 
-  .de-grid-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .de-grid-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px 16px; align-items: end; }
 
   table.de-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.de-table th {
@@ -1308,8 +1316,8 @@ function renderRegisto(){
   const statusHolder = wrap.querySelector('#reg-status-holder');
   const isFalta = existing && existing.noOperation;
   const hasRealData = existing && !isFalta && (Object.keys(existing.fixed||{}).length || Object.values(existing.entities||{}).some(ev=>Object.keys(ev||{}).length));
-  statusHolder.innerHTML = `<span class="de-status ${isFalta?'inactive':existing?'saved':'new'}">${isFalta?ICONS.inbox+' marcado como sem operação':existing?'já tem registo — a editar':'ainda sem registo'}</span>
-    <button class="de-btn ghost small" id="reg-mark-falta" style="margin-left:8px;">${isFalta?ICONS.x+' Desmarcar':ICONS.inbox+' Marcar sem operação hoje'}</button>
+  statusHolder.innerHTML = `<span class="de-status ${isFalta?'inactive':existing?'saved':'new'}">${isFalta?ICONS.inbox2+' marcado como sem operação':existing?'já tem registo — a editar':'ainda sem registo'}</span>
+    <button class="de-btn ghost small" id="reg-mark-falta" style="margin-left:8px;">${isFalta?ICONS.x+' Desmarcar':ICONS.inbox2+' Marcar sem operação hoje'}</button>
     ${existing ? `<button class="de-btn danger" id="reg-delete-record" style="margin-left:8px;">${ICONS.trash} Apagar este registo permanentemente</button>` : ''}`;
   statusHolder.querySelector('#reg-mark-falta').onclick = async ()=>{
     const recs = STATE.recordsCache[op.id] || (STATE.recordsCache[op.id] = {});
@@ -1648,8 +1656,8 @@ function renderRegisto(){
     derivedFixed.forEach(f=>{
       const fdiv = document.createElement('div');
       fdiv.className = 'de-field';
-      fdiv.innerHTML = `<label>${f.label} <button class="de-rename-btn" data-rename-field="${f.key}" title="Renomear campo">${ICONS.pencil}</button> <span style="color:var(--blue);font-weight:700;">(soma automática)</span></label>
-        <div data-derived-fixed="${f.key}" data-derived-role="${f.role}" style="font-family:var(--font-mono);font-size:20px;font-weight:800;color:var(--green);padding:9px 0;">${fmt(computeDerivedTotal(f.role))}</div>`;
+      fdiv.innerHTML = `<label>${f.label} <button class="de-rename-btn" data-rename-field="${f.key}" title="Renomear campo">${ICONS.pencil}</button> <span class="de-auto-chip" title="Calculado automaticamente a partir dos valores por ${op.repeating ? op.repeating.entityLabel.toLowerCase() : 'entidade'}">soma automática</span></label>
+        <div class="de-derived-box" data-derived-fixed="${f.key}" data-derived-role="${f.role}">${fmt(computeDerivedTotal(f.role))}</div>`;
       grid.appendChild(fdiv);
     });
     card.appendChild(grid);
@@ -2236,12 +2244,54 @@ let analisesSel = { subtab:'mensal', opId:'all', year:2026, month: new Date().ge
 let chartInstances = [];
 function destroyCharts(){ chartInstances.forEach(c=>c.destroy()); chartInstances = []; }
 
+// ------------------------------------------------------------
+// FERIADOS NACIONAIS (Portugal) e FINS DE SEMANA
+// Um sábado, domingo ou feriado sem números (vazio ou tudo a 0) é tratado
+// automaticamente como "sem operação": não entra nas médias nem gera alerta.
+// ------------------------------------------------------------
+const _feriadosCache = {};
+function easterSunday(y){ // algoritmo de Meeus/Jones/Butcher
+  const a=y%19, b=Math.floor(y/100), c=y%100, d=Math.floor(b/4), e=b%4, f=Math.floor((b+8)/25), g=Math.floor((b-f+1)/3);
+  const h=(19*a+b-d-g+15)%30, i=Math.floor(c/4), k=c%4, l=(32+2*e+2*i-h-k)%7, m=Math.floor((a+11*h+22*l)/451);
+  const month=Math.floor((h+l-7*m+114)/31), day=((h+l-7*m+114)%31)+1;
+  return y+'-'+String(month).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+}
+function feriadosPT(y){
+  if (_feriadosCache[y]) return _feriadosCache[y];
+  const pascoa = easterSunday(y);
+  const f = {
+    [y+'-01-01']:'Ano Novo', [y+'-04-25']:'Dia da Liberdade', [y+'-05-01']:'Dia do Trabalhador', [y+'-06-10']:'Dia de Portugal',
+    [y+'-08-15']:'Assunção de Nossa Senhora', [y+'-10-05']:'Implantação da República', [y+'-11-01']:'Todos os Santos',
+    [y+'-12-01']:'Restauração da Independência', [y+'-12-08']:'Imaculada Conceição', [y+'-12-25']:'Natal',
+  };
+  f[addDays(pascoa,-2)] = 'Sexta-feira Santa';
+  f[pascoa] = 'Páscoa';
+  f[addDays(pascoa,60)] = 'Corpo de Deus';
+  return (_feriadosCache[y] = f);
+}
+function feriadoNome(dateStr){ return feriadosPT(Number(dateStr.slice(0,4)))[dateStr] || null; }
+function isFimDeSemana(dateStr){ const dow = new Date(dateStr+'T00:00:00').getDay(); return dow===0 || dow===6; }
+function isAutoSemOperacao(dateStr){ return isFimDeSemana(dateStr) || !!feriadoNome(dateStr); }
+// O cliente costuma trabalhar neste dia da semana? (≥ metade dos mesmos dias nas 8 semanas anteriores com números)
+function opTrabalhaNesteDiaSemana(op, dateStr){
+  const records = STATE.recordsCache[op.id] || {};
+  let com = 0;
+  for (let w=1; w<=8; w++){
+    const d = addDays(dateStr, -7*w);
+    const r = records[d];
+    if (r && !r.noOperation && (dayEntregues(op, r) || dayTotal(op, r))) com++;
+  }
+  return com >= 4;
+}
+
 function computeOpDayStats(op, dateStr, entityFilter){
   const records = STATE.recordsCache[op.id] || {};
   const rec = records[dateStr];
   if (!rec || rec.noOperation) return null;
   const entregues = dayEntregues(op, rec, entityFilter);
   const total = dayTotal(op, rec, entityFilter);
+  // Fim de semana / feriado com tudo a 0 = não houve operação (não baixa a média)
+  if (!entregues && !total && !rec.monthlySummary && isAutoSemOperacao(dateStr)) return null;
   return { entregues, total, edr: total>0? entregues/total : null };
 }
 
@@ -2282,6 +2332,10 @@ function computeMissingDaysForMonth(op, year, month){
     if (!workDays.includes(dow)) return;
     const rec = records[d];
     if (rec && rec.noOperation) return;
+    // Feriado nacional: assume-se sem operação (sem alerta).
+    // Fim de semana: só alerta se o cliente costuma trabalhar nesse dia (≥ 4 das últimas 8 semanas com números).
+    if (feriadoNome(d)) return;
+    if (isFimDeSemana(d) && !opTrabalhaNesteDiaSemana(op, d)) return;
     if (op.repeating && op.repeating.entities.length){
       const absences = (rec && rec.absences) || {};
       const entities = (rec && rec.entities) || {};
@@ -2641,7 +2695,8 @@ function renderPanorama(wrap){
     const bg = weekend ? C.weekend : (i%2 ? C.zebra : '#fff');
     const cell = (v, opt={}) => `<td style="padding:7px 8px;text-align:center;font-size:12.5px;${opt.style||''}">${v}</td>`;
     if (r.status!=='ok'){
-      const label = r.status==='semop' ? 'Sem operação' : 'Sem registo';
+      const fer = feriadoNome(r.ds);
+      const label = r.status==='semop' ? 'Sem operação' : fer ? `Feriado · ${fer}` : isFimDeSemana(r.ds) ? 'Sem operação · fim de semana' : 'Sem registo';
       return `<tr style="background:${bg};" data-pan-day="${r.ds}">${cell(r.d,{style:'font-weight:800;color:'+C.ink})}${cell(diasSemana[r.dow],{style:'color:'+C.dim+';text-align:left'})}<td colspan="${4+motivosVis.length}" style="padding:7px 10px;font-size:11.5px;color:${C.faint};font-style:italic;">${label}</td></tr>`;
     }
     const lv = panLevelColor(r.edr);
