@@ -722,6 +722,7 @@ async function savePesos(opId, entries, imports){
     await db.collection('pesos').doc(opId).set({
       entries: entries,
       imports: STATE.pesosImports[opId] || {},
+      reentregas: STATE.pesosReent[opId] || {},
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     setConnStatus(true);
@@ -854,6 +855,7 @@ function ensurePesosListeners(){
     _pesosListeners[opId] = db.collection('pesos').doc(opId).onSnapshot(doc=>{
       STATE.pesosCache[opId] = doc.exists ? (doc.data().entries || {}) : {};
       STATE.pesosImports[opId] = doc.exists ? (doc.data().imports || {}) : {};
+      STATE.pesosReent[opId] = doc.exists ? (doc.data().reentregas || {}) : {};
       setConnStatus(true);
       if (!isEditingNow() && STATE.tab==='pesos') render();
     }, err=>{
@@ -905,6 +907,7 @@ let STATE = {
   recordsCache: {},
   pesosCache: {},
   pesosImports: {},
+  pesosReent: {},
   importFlags: {},
   auditLog: [],
   toastTimer: null,
@@ -3387,6 +3390,71 @@ function parseDeltaWorkbook(wb, fileName){
   return { ok:false, error:'Não encontrei nenhuma folha com a coluna "Peso". Confirma que é o ficheiro de processamento de entregas da Delta.' };
 }
 
+// ------------------------------------------------------------
+// REENTREGAS: encomendas não entregues por Ausente/Recusado num dia
+// voltam a sair no dia de operação seguinte, mas não vêm no ficheiro
+// da Delta. São faturadas nesse dia, no escalão 0–30kg (peso desconhecido).
+// O valor vem automaticamente do Registo (campos "Ausente" e "Recusado"
+// do dia de operação anterior) e pode ser corrigido à mão por dia.
+// ------------------------------------------------------------
+function reentregaFields(op){
+  const isR = f => /ausente|recusad/i.test(f.label||'') || /ausente|recusad/i.test(f.key||'');
+  return { fixed: (op.fields||[]).filter(isR), rep: op.repeating ? op.repeating.fields.filter(isR) : [] };
+}
+function naoEntreguesReentrega(op, rec){
+  if (!rec || rec.noOperation || rec.monthlySummary) return { n:0, detalhe:'' };
+  const rf = reentregaFields(op);
+  const parts = {};
+  rf.fixed.forEach(f=>{ const v = Number(rec.fixed && rec.fixed[f.key])||0; if (v) parts[f.label] = (parts[f.label]||0)+v; });
+  rf.rep.forEach(f=>{ Object.values(rec.entities||{}).forEach(ev=>{ const v = Number(ev && ev[f.key])||0; if (v) parts[f.label] = (parts[f.label]||0)+v; }); });
+  const n = Object.values(parts).reduce((a,b)=>a+b,0);
+  return { n, detalhe: Object.entries(parts).map(([k,v])=>v+' '+k.toLowerCase()).join(' + ') };
+}
+// Houve operação neste dia? = tem ficheiro/pesos lançados OU Registo preenchido
+// (dias marcados "sem operação" não contam). Assim, um sábado sem trabalho
+// é saltado e as reentregas de sexta passam para segunda.
+function opTeveOperacao(opId, d){
+  const rec = (STATE.recordsCache[opId]||{})[d];
+  if (rec && rec.noOperation) return false;
+  if (((STATE.pesosCache[opId]||{})[d]||[]).length) return true;
+  if (!rec || rec.monthlySummary) return false;
+  return Object.values(rec.fixed||{}).some(v=>Number(v)) || Object.values(rec.entities||{}).some(ev=>Object.values(ev||{}).some(v=>Number(v)));
+}
+// Último dia antes de dateStr em que houve operação (até 10 dias atrás)
+function diaOperacaoAnterior(op, dateStr){
+  for (let i=1; i<=10; i++){
+    const d = addDays(dateStr, -i);
+    if (opTeveOperacao(op.id, d)) return d;
+  }
+  return null;
+}
+// Nº de encomendas do Registo nesse dia (o mesmo número usado nas Análises)
+function encomendasRegisto(opId, d){
+  const op = STATE.operations.find(o=>o.id===opId);
+  const rec = (STATE.recordsCache[opId]||{})[d];
+  if (!op || !rec || rec.noOperation || rec.monthlySummary) return null;
+  const t = dayTotal(op, rec);
+  return t || null;
+}
+// Reentregas a faturar no dia dateStr: { n, auto, manual, origem, detalhe }
+function reentregasDoDia(opId, dateStr){
+  const op = STATE.operations.find(o=>o.id===opId);
+  if (!op) return { n:0, auto:0, manual:null, origem:null, detalhe:'' };
+  const prev = diaOperacaoAnterior(op, dateStr);
+  const a = prev ? naoEntreguesReentrega(op, (STATE.recordsCache[opId]||{})[prev]) : { n:0, detalhe:'' };
+  const man = (STATE.pesosReent[opId]||{})[dateStr];
+  const manual = (man===undefined || man===null) ? null : Number(man);
+  return { n: manual!==null ? manual : a.n, auto: a.n, manual, origem: prev, detalhe: a.detalhe };
+}
+// Totais de faturação de um dia: ficheiro + reentregas (reentregas contam como 0–30kg)
+function faturacaoDoDia(opId, dateStr){
+  const b = bucketizeWeights((STATE.pesosCache[opId]||{})[dateStr] || []);
+  const r = reentregasDoDia(opId, dateStr);
+  const reg = encomendasRegisto(opId, dateStr);
+  const totalFat = b.total + r.n;
+  return { ...b, reent: r.n, reentInfo: r, b1Fat: b.b1 + r.n, totalFat, registo: reg, diff: (reg!==null && totalFat) ? totalFat - reg : null };
+}
+
 function renderPesos(){
   const body = document.getElementById('de-body');
   const wrap = document.createElement('div');
@@ -3481,28 +3549,47 @@ function renderPesos(){
   // ---------- Resumo de faturação do mês ----------
   const tableCard = document.createElement('div');
   tableCard.className = 'de-card';
-  let sum = { total:0, b1:0, b2:0, kg:0, dias:0 };
+  const rf = op ? reentregaFields(op) : { fixed:[], rep:[] };
+  const temCamposReent = rf.fixed.length + rf.rep.length > 0;
+  let sum = { total:0, reent:0, b1:0, b2:0, fat:0, kg:0, dias:0, reg:0, difDias:0, okDias:0 };
   const today = todayISO();
   const rowsHtml = monthDates.map(ds=>{
-    const weights = entries[ds] || [];
-    const b = bucketizeWeights(weights);
+    const f = faturacaoDoDia(pesosSel.opId, ds);
+    const r = f.reentInfo;
     const imp = imports[ds];
-    if (b.total){ sum.total+=b.total; sum.b1+=b.b1; sum.b2+=b.b2; sum.kg+=b.kg; sum.dias++; }
+    if (f.total || f.reent){ sum.total+=f.total; sum.reent+=f.reent; sum.b1+=f.b1Fat; sum.b2+=f.b2; sum.fat+=f.totalFat; sum.kg+=f.kg; sum.dias++; }
+    if (f.registo!==null) sum.reg += f.registo;
+    if (f.diff!==null){ if (f.diff===0) sum.okDias++; else sum.difDias++; }
+    let confere = '';
+    if (f.totalFat && f.registo===null) confere = `<span style="font-size:11.5px;color:#d99a1c;" title="Ainda não há Encomendas no Registo deste dia">falta Registo</span>`;
+    else if (!f.totalFat && f.registo!==null) confere = `<span style="font-size:11.5px;color:#d99a1c;" title="Há Registo mas não foi importado o ficheiro da Delta">falta ficheiro</span>`;
+    else if (f.diff===0) confere = `<span style="color:var(--green);font-weight:800;" title="Bate certo com o Registo">${ICONS.check}</span>`;
+    else if (f.diff!==null) confere = `<span class="de-badge" style="background:rgba(229,72,77,.12);color:var(--red);" title="Faturação ${f.totalFat} vs Registo ${f.registo}">${f.diff>0?'+':''}${f.diff}</span>`;
     const d = Number(ds.slice(8,10));
-    const origem = !b.total ? '' : imp && imp.fileName
+    const vazio = '<span style="color:var(--text-faint);">—</span>';
+    const origem = !f.total ? '' : imp && imp.fileName
       ? `<span title="${imp.fileName} — importado ${imp.ts?new Date(imp.ts).toLocaleString('pt-PT'):''}${imp.user?' por '+imp.user:''}" style="font-size:11.5px;color:var(--text-faint);">${ICONS.note} ficheiro</span>`
       : `<span style="font-size:11.5px;color:var(--text-faint);">manual</span>`;
-    const suspeito = b.acima ? ` <span class="de-badge" title="Há ${b.acima} peso(s) acima de 60kg — pode ter sido lançado com o erro antigo da vírgula. Reimporta o ficheiro deste dia." style="background:rgba(229,72,77,.12);color:var(--red);cursor:help;">verificar</span>` : '';
-    return `<tr ${ds===today?'style="background:var(--row-hover);"':''}${b.total?'':' class="pesos-empty-row"'}>
+    const suspeito = f.acima ? ` <span class="de-badge" title="Há ${f.acima} peso(s) acima de 60kg — pode ter sido lançado com o erro antigo da vírgula. Reimporta o ficheiro deste dia." style="background:rgba(229,72,77,.12);color:var(--red);cursor:help;">verificar</span>` : '';
+    const origemTxt = r.origem ? 'do Registo de '+r.origem.split('-').reverse().join('/') : 'sem dia de operação anterior registado';
+    const reentTitle = r.manual!==null
+      ? `Valor corrigido à mão (automático ${origemTxt}: ${r.auto}). Clica para alterar.`
+      : `Vindas ${origemTxt}${r.detalhe?': '+r.detalhe:' — nenhuma não entregue por ausente/recusado'}. Clica para corrigir.`;
+    const reentCell = `<button class="de-btn ghost small" data-reent-edit="${ds}" title="${reentTitle}" style="min-width:44px;${r.manual!==null?'border-color:#d99a1c;color:#d99a1c;':''}">${f.reent || '—'}${r.manual!==null?' ✎':''}</button>`;
+    return `<tr ${ds===today?'style="background:var(--row-hover);"':''}>
       <td>${String(d).padStart(2,'0')} <span style="color:var(--text-faint);">${weekdayName(ds).slice(0,3)}</span></td>
-      <td>${b.total ? '<strong>'+b.total+'</strong>' : '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>${b.total ? `<span style="color:var(--green);font-weight:700;">${b.b1}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>${b.total ? `<span style="color:var(--blue);font-weight:700;">${b.b2}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td style="font-family:var(--font-mono);font-size:12.5px;">${b.total ? fmtKg(b.kg)+' kg' : ''}</td>
+      <td>${f.total ? f.total : vazio}</td>
+      <td>${reentCell}</td>
+      <td>${(f.total||f.reent) ? `<span style="color:var(--green);font-weight:700;">${f.b1Fat}</span>` : vazio}</td>
+      <td>${(f.total||f.reent) ? `<span style="color:var(--blue);font-weight:700;">${f.b2}</span>` : vazio}</td>
+      <td>${(f.total||f.reent) ? `<strong>${f.totalFat}</strong>` : vazio}</td>
+      <td>${f.registo!==null ? f.registo : vazio}</td>
+      <td style="text-align:center;">${confere}</td>
+      <td style="font-family:var(--font-mono);font-size:12.5px;">${f.total ? fmtKg(f.kg)+' kg' : ''}</td>
       <td>${origem}${suspeito}</td>
       <td style="white-space:nowrap;">
-        <button class="de-btn ghost small" data-pesos-edit="${ds}" type="button" title="Ver / corrigir manualmente">${ICONS.pencil}</button>
-        ${b.total ? `<button class="de-btn danger" data-pesos-del="${ds}" type="button" title="Limpar este dia">${ICONS.trash}</button>` : ''}
+        <button class="de-btn ghost small" data-pesos-edit="${ds}" type="button" title="Ver / corrigir pesos manualmente">${ICONS.pencil}</button>
+        ${f.total ? `<button class="de-btn danger" data-pesos-del="${ds}" type="button" title="Limpar os pesos deste dia">${ICONS.trash}</button>` : ''}
       </td>
     </tr>`;
   }).join('');
@@ -3512,19 +3599,28 @@ function renderPesos(){
       <button class="de-btn ghost small" id="pesos-export">${ICONS.download} Exportar faturação do mês (Excel)</button>
     </div>
     <div class="de-kpis" style="margin-bottom:14px;">
-      <div class="de-kpi"><div class="label">Encomendas no mês</div><div class="value">${sum.total}</div></div>
+      <div class="de-kpi"><div class="label">Total a faturar</div><div class="value">${sum.fat}</div></div>
       <div class="de-kpi"><div class="label">Escalão 0–30kg</div><div class="value green">${sum.b1}</div></div>
       <div class="de-kpi"><div class="label">Escalão 31–60kg</div><div class="value blue">${sum.b2}</div></div>
-      <div class="de-kpi"><div class="label">Dias com dados</div><div class="value">${sum.dias}</div></div>
+      <div class="de-kpi"><div class="label">Das quais reentregas</div><div class="value">${sum.reent}</div></div>
+      <div class="de-kpi"><div class="label">Encomendas no Registo</div><div class="value ${sum.reg===sum.fat?'green':'red'}">${sum.reg}</div></div>
+      <div class="de-kpi"><div class="label">Dias com diferença</div><div class="value ${sum.difDias?'red':'green'}">${sum.difDias}</div></div>
+    </div>
+    <div class="de-note" style="margin-bottom:10px;">
+      <strong>Reentregas</strong> = encomendas não entregues por <em>ausente</em> ou <em>recusado</em> no último dia em que houve operação — se não trabalharam ao sábado, as de sexta passam para segunda (vêm do Registo). Não aparecem no ficheiro da Delta, por isso são somadas aqui e faturadas no escalão 0–30kg. Clica no número para corrigir um dia.<br><strong>Confere</strong> compara o total a faturar com as <em>Encomendas</em> lançadas no Registo (o número usado nas Análises) — ${ICONS.check} bate certo, a vermelho a diferença.
+      ${!temCamposReent ? `<br><span style="color:var(--red);">${ICONS.warning} ${opName} não tem campos "Ausente"/"Recusado" no Registo — as reentregas ficam a 0 até as preencheres à mão ou criares esses campos em Configurações.</span>` : ''}
     </div>
     <div style="overflow-x:auto;">
     <table class="de-table">
-      <thead><tr><th>Dia</th><th>Encomendas</th><th>0–30kg</th><th>31–60kg</th><th>Peso total</th><th>Origem</th><th></th></tr></thead>
+      <thead><tr><th>Dia</th><th>Ficheiro Delta</th><th>Reentregas</th><th>0–30kg</th><th>31–60kg</th><th>Total a faturar</th><th>Registo</th><th>Confere</th><th>Peso (ficheiro)</th><th>Origem</th><th></th></tr></thead>
       <tbody>${rowsHtml}</tbody>
       <tfoot><tr style="font-weight:800;">
-        <td>Total</td><td>${sum.total}</td>
+        <td>Total</td><td>${sum.total}</td><td>${sum.reent}</td>
         <td style="color:var(--green);">${sum.b1}</td>
         <td style="color:var(--blue);">${sum.b2}</td>
+        <td>${sum.fat}</td>
+        <td>${sum.reg}</td>
+        <td style="text-align:center;">${sum.reg===sum.fat ? `<span style="color:var(--green);">${ICONS.check}</span>` : `<span style="color:var(--red);">${sum.fat-sum.reg>0?'+':''}${sum.fat-sum.reg}</span>`}</td>
         <td style="font-family:var(--font-mono);font-size:12.5px;">${fmtKg(sum.kg)} kg</td>
         <td colspan="2"></td>
       </tr></tfoot>
@@ -3664,31 +3760,52 @@ function renderPesos(){
   document.getElementById('pesos-export').onclick = ()=>{
     // Uma folha por operação com pesos (ex: Delta Lisboa e Delta Montijo) + resumo
     const wbOut = XLSX.utils.book_new();
-    const resumo = [['Operação','Encomendas','0–30kg','31–60kg','Peso total (kg)','Dias com dados']];
+    const resumo = [['Operação','Ficheiro Delta','Reentregas','0–30kg','31–60kg','Total a faturar','Peso ficheiro (kg)']];
     PESOS_LIST.forEach(id=>{
       const o = STATE.operations.find(x=>x.id===id);
       const ent = STATE.pesosCache[id] || {};
       const imp = STATE.pesosImports[id] || {};
-      const rows = [['Dia','Dia da semana','Encomendas','0–30kg','31–60kg','Peso total (kg)','Origem']];
-      const t = { total:0, b1:0, b2:0, kg:0, dias:0 };
+      const rows = [['Dia','Dia da semana','Ficheiro Delta','Reentregas','0–30kg','31–60kg','Total a faturar','Encomendas Registo','Diferença','Peso ficheiro (kg)','Origem']];
+      const t = { total:0, reent:0, b1:0, b2:0, fat:0, kg:0 };
       monthDates.forEach(ds=>{
-        const b = bucketizeWeights(ent[ds] || []);
-        if (b.total){ t.total+=b.total; t.b1+=b.b1; t.b2+=b.b2; t.kg+=b.kg; t.dias++; }
-        rows.push([ds.split('-').reverse().join('/'), weekdayName(ds), b.total||'', b.total?b.b1:'', b.total?b.b2:'', b.total?Math.round(b.kg*10)/10:'', b.total?((imp[ds]&&imp[ds].fileName)||'manual'):'']);
+        const f = faturacaoDoDia(id, ds);
+        const has = f.total || f.reent;
+        if (has){ t.total+=f.total; t.reent+=f.reent; t.b1+=f.b1Fat; t.b2+=f.b2; t.fat+=f.totalFat; t.kg+=f.kg; }
+        if (f.registo!==null) t.reg = (t.reg||0) + f.registo;
+        rows.push([ds.split('-').reverse().join('/'), weekdayName(ds), f.total||'', f.reent||'', has?f.b1Fat:'', has?f.b2:'', has?f.totalFat:'', f.registo!==null?f.registo:'', f.diff!==null?f.diff:'', f.total?Math.round(f.kg*10)/10:'', f.total?((imp[ds]&&imp[ds].fileName)||'manual'):'']);
       });
-      rows.push(['TOTAL','',t.total,t.b1,t.b2,Math.round(t.kg*10)/10,'']);
-      resumo.push([o?o.name:id, t.total, t.b1, t.b2, Math.round(t.kg*10)/10, t.dias]);
+      rows.push(['TOTAL','',t.total,t.reent,t.b1,t.b2,t.fat,t.reg||0,t.fat-(t.reg||0),Math.round(t.kg*10)/10,'']);
+      resumo.push([o?o.name:id, t.total, t.reent, t.b1, t.b2, t.fat, Math.round(t.kg*10)/10]);
       const ws = XLSX.utils.aoa_to_sheet(rows);
-      ws['!cols'] = [{wch:12},{wch:14},{wch:12},{wch:10},{wch:10},{wch:15},{wch:50}];
+      ws['!cols'] = [{wch:12},{wch:14},{wch:14},{wch:12},{wch:10},{wch:10},{wch:15},{wch:18},{wch:10},{wch:17},{wch:50}];
       XLSX.utils.book_append_sheet(wbOut, ws, String(o?o.name:id).replace(/[\\\/\?\*\[\]:]/g,'').slice(0,31));
     });
     const wsR = XLSX.utils.aoa_to_sheet(resumo);
-    wsR['!cols'] = [{wch:24},{wch:12},{wch:10},{wch:10},{wch:15},{wch:15}];
+    wsR['!cols'] = [{wch:24},{wch:14},{wch:12},{wch:10},{wch:10},{wch:15},{wch:17}];
     XLSX.utils.book_append_sheet(wbOut, wsR, 'Resumo');
     wbOut.SheetNames.unshift(wbOut.SheetNames.pop());
     XLSX.writeFile(wbOut, `faturacao-pesos-${pesosSel.date.slice(0,7)}.xlsx`);
   };
 
+  wrap.querySelectorAll('[data-reent-edit]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const ds = btn.dataset.reentEdit;
+      const r = reentregasDoDia(pesosSel.opId, ds);
+      const val = prompt(`Reentregas a faturar em ${ds.split('-').reverse().join('/')} (${opName}).\n\n${r.origem ? 'O Registo de '+r.origem.split('-').reverse().join('/')+' (último dia com operação) indica '+r.auto+(r.detalhe?' ('+r.detalhe+')':'') : 'Não há dia de operação anterior registado'}.\n\nEscreve o número correto, ou deixa vazio para voltar ao valor automático do Registo:`, r.manual!==null ? r.manual : r.auto);
+      if (val===null) return;
+      const map = { ...(STATE.pesosReent[pesosSel.opId] || {}) };
+      const t = val.trim();
+      if (t===''){ delete map[ds]; }
+      else {
+        const n = parseInt(t,10);
+        if (isNaN(n) || n<0){ toast('Número inválido'); return; }
+        if (n===r.auto) delete map[ds]; else map[ds] = n;
+      }
+      STATE.pesosReent[pesosSel.opId] = map;
+      const ok = await savePesos(pesosSel.opId, STATE.pesosCache[pesosSel.opId] || {});
+      if (ok){ await logEdit('Corrigiu reentregas', `${opName} — ${ds} — ${t===''?'automático ('+r.auto+')':t}`); toast('Reentregas atualizadas'); render(); }
+    };
+  });
   wrap.querySelectorAll('[data-pesos-edit]').forEach(btn=>{
     btn.onclick = ()=>{ pesosSel.date = btn.dataset.pesosEdit; pesosManualOpen = true; render(); setTimeout(()=>{ const i=document.getElementById('pesos-input'); if(i){ i.scrollIntoView({behavior:'smooth',block:'center'}); } },50); };
   });
@@ -4583,6 +4700,7 @@ async function init(){
       const pesosSnap = await db.collection('pesos').doc(opId).get();
       STATE.pesosCache[opId] = pesosSnap.exists ? (pesosSnap.data().entries || {}) : {};
       STATE.pesosImports[opId] = pesosSnap.exists ? (pesosSnap.data().imports || {}) : {};
+      STATE.pesosReent[opId] = pesosSnap.exists ? (pesosSnap.data().reentregas || {}) : {};
     }));
 
     await autoImportHistoricoIfNeeded();
