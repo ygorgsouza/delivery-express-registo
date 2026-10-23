@@ -715,11 +715,13 @@ async function saveRecords(opId, records){
   }
 }
 
-async function savePesos(opId, entries){
+async function savePesos(opId, entries, imports){
   STATE.pesosCache[opId] = entries;
+  if (imports) STATE.pesosImports[opId] = imports;
   try {
     await db.collection('pesos').doc(opId).set({
       entries: entries,
+      imports: STATE.pesosImports[opId] || {},
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     setConnStatus(true);
@@ -851,6 +853,7 @@ function ensurePesosListeners(){
     if (_pesosListeners[opId]) return;
     _pesosListeners[opId] = db.collection('pesos').doc(opId).onSnapshot(doc=>{
       STATE.pesosCache[opId] = doc.exists ? (doc.data().entries || {}) : {};
+      STATE.pesosImports[opId] = doc.exists ? (doc.data().imports || {}) : {};
       setConnStatus(true);
       if (!isEditingNow() && STATE.tab==='pesos') render();
     }, err=>{
@@ -901,6 +904,7 @@ let STATE = {
   operations: [],
   recordsCache: {},
   pesosCache: {},
+  pesosImports: {},
   importFlags: {},
   auditLog: [],
   toastTimer: null,
@@ -3242,22 +3246,112 @@ function renderAlertas(){
 }
 
 // ============================================================
-// RENDER: PESOS TAB (registo de kg para faturação por escalão de peso)
+// RENDER: PESOS TAB — faturação por escalão de peso
+// ------------------------------------------------------------
+// Fonte principal: o ficheiro Excel diário da Delta (folha "MAPA"),
+// com uma linha por encomenda, "Data Entrega" e "Peso (Kg)".
+// O sistema conta as encomendas e separa por escalão (0–30kg / 31–60kg).
+// Cada ficheiro substitui os dados desse dia (reimportar não duplica).
+// Guardado em pesos/{opId}: entries[data] = [pesos], imports[data] = {origem}
 // ============================================================
 let pesosSel = { opId: null, date: todayISO() };
+let pesosPending = null;     // pré-visualização de importação à espera de confirmação
+let pesosManualOpen = false;
+const PESO_ESCALAO_1 = 30;   // até 30kg (inclusive) = escalão 1; acima = escalão 2
+const PESO_MAX_ESPERADO = 60;
 
+// Converte um peso (número ou texto) em número. Vírgula = casa decimal (formato PT).
+function toKg(v){
+  if (v===null || v===undefined || v==='') return null;
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  let s = String(v).trim().replace(/\s|kg/gi,'');
+  if (!s) return null;
+  if (s.includes(',') && s.includes('.')) s = s.replace(/\./g,'').replace(',','.');
+  else s = s.replace(',','.');
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
+}
+// Lançamento manual: um peso por linha (também aceita tab, ; ou espaço).
+// A vírgula é sempre lida como casa decimal — "19,765" = 19,765 kg.
 function parseWeights(text){
-  return text
-    .split(/[\n,;]+/)
-    .map(s => s.trim().replace(',', '.'))
-    .filter(s => s.length > 0)
-    .map(s => parseFloat(s))
-    .filter(n => !isNaN(n) && n >= 0);
+  return String(text||'')
+    .split(/[\n\r\t;]+|\s+/)
+    .map(toKg)
+    .filter(n => n!==null && n >= 0);
 }
 function bucketizeWeights(weights){
-  let b1 = 0, b2 = 0;
-  weights.forEach(w => { if (w <= 30) b1++; else b2++; });
-  return { b1, b2, total: weights.length };
+  let b1 = 0, b2 = 0, kg = 0, acima = 0;
+  weights.forEach(w => {
+    kg += w;
+    if (w <= PESO_ESCALAO_1) b1++; else b2++;
+    if (w > PESO_MAX_ESPERADO) acima++;
+  });
+  return { b1, b2, total: weights.length, kg, acima };
+}
+function fmtKg(n){
+  return (Math.round(n*10)/10).toLocaleString('pt-PT', { minimumFractionDigits:1, maximumFractionDigits:1 });
+}
+function normHeader(v){
+  return String(v||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/\s+/g,' ').trim();
+}
+function parseDeltaDate(v){
+  if (v===null || v===undefined || v==='') return null;
+  if (v instanceof Date && !isNaN(v)) return v.getFullYear()+'-'+String(v.getMonth()+1).padStart(2,'0')+'-'+String(v.getDate()).padStart(2,'0');
+  if (typeof v === 'number'){ // número de série do Excel
+    const d = new Date(Math.round((v - 25569) * 86400000));
+    return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})/);
+  if (m) return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1]+'-'+m[2]+'-'+m[3];
+  return null;
+}
+
+// Lê o ficheiro da Delta e devolve as encomendas agrupadas por data de entrega.
+function parseDeltaWorkbook(wb, fileName){
+  const names = wb.SheetNames.slice();
+  const ordered = names.filter(n=>normHeader(n)==='mapa').concat(names.filter(n=>normHeader(n)!=='mapa'));
+  for (const sheetName of ordered){
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header:1, raw:true, defval:null });
+    for (let h=0; h<Math.min(rows.length, 15); h++){
+      const hdr = (rows[h]||[]).map(normHeader);
+      const iPeso = hdr.findIndex(x=>x.startsWith('peso'));
+      if (iPeso < 0) continue;
+      const iData = hdr.findIndex(x=>x.includes('data entrega')) >= 0 ? hdr.findIndex(x=>x.includes('data entrega')) : hdr.findIndex(x=>x.startsWith('data'));
+      const iDoc = hdr.findIndex(x=>x.startsWith('doc'));
+      const iCli = hdr.findIndex(x=>x==='cliente');
+      const iCentro = hdr.findIndex(x=>x==='centro');
+      const byDate = {}; const centros = {};
+      let semData = 0, semPeso = 0, duplicados = 0;
+      const seenDocs = new Set();
+      for (let r=h+1; r<rows.length; r++){
+        const row = rows[r] || [];
+        const peso = toKg(row[iPeso]);
+        const doc = iDoc>=0 ? row[iDoc] : null;
+        const cli = iCli>=0 ? row[iCli] : null;
+        if (peso===null && (doc===null || doc==='') && (cli===null || cli==='')) continue; // linha vazia
+        if (doc!==null && doc!==''){
+          const k = String(doc).trim();
+          if (seenDocs.has(k)){ duplicados++; continue; }
+          seenDocs.add(k);
+        }
+        const data = iData>=0 ? parseDeltaDate(row[iData]) : null;
+        const key = data || '__sem_data__';
+        if (!data) semData++;
+        if (peso===null) semPeso++;
+        (byDate[key] = byDate[key] || []).push(peso===null ? 0 : peso);
+        if (iCentro>=0 && row[iCentro]) { const c = String(row[iCentro]).trim(); centros[c] = (centros[c]||0)+1; }
+      }
+      if (!Object.keys(byDate).length) continue;
+      // Centro: o mais frequente na coluna; se faltar, tenta pelo nome do ficheiro (ex: "... MRSE ...")
+      let centro = Object.entries(centros).sort((a,b)=>b[1]-a[1]).map(e=>e[0])[0] || null;
+      if (!centro){ const m = String(fileName||'').match(/\bMR[A-Z]{2}\b/); if (m) centro = m[0]; }
+      return { ok:true, sheet: sheetName, byDate, centro, semData, semPeso, duplicados };
+    }
+  }
+  return { ok:false, error:'Não encontrei nenhuma folha com a coluna "Peso". Confirma que é o ficheiro de processamento de entregas da Delta.' };
 }
 
 function renderPesos(){
@@ -3275,20 +3369,20 @@ function renderPesos(){
   const op = STATE.operations.find(o=>o.id===pesosSel.opId);
   const opName = op ? op.name : pesosSel.opId;
   const entries = STATE.pesosCache[pesosSel.opId] || {};
+  const imports = STATE.pesosImports[pesosSel.opId] || {};
   const year = Number(pesosSel.date.slice(0,4));
   const month = Number(pesosSel.date.slice(5,7));
-  const totalDaysInMonth = daysInMonth(year, month);
   const monthDates = allDatesForMonth(year, month);
 
   const intro = document.createElement('div');
   intro.style.cssText = 'font-size:13px;color:var(--text-faint);margin-bottom:16px;';
-  intro.textContent = `Lança os pesos (kg) das encomendas do dia — o sistema separa automaticamente por escalão (0–30kg / 31kg+) para a faturação de ${opName}.`;
+  intro.textContent = `Importa o ficheiro diário da Delta — o sistema conta as encomendas e separa-as por escalão de peso (0–30kg / 31–60kg) para a faturação. Cada operação (rota) tem os seus próprios números.`;
   wrap.appendChild(intro);
 
   const nav = document.createElement('div');
   nav.className = 'de-row';
   nav.innerHTML = `
-    ${PESOS_LIST.length > 1 ? `<div class="de-field"><label>Operação</label><select id="pesos-op">${PESOS_LIST.map(id=>{ const o2 = STATE.operations.find(x=>x.id===id); return `<option value="${id}" ${id===pesosSel.opId?'selected':''}>${o2?o2.name:id}</option>`; }).join('')}</select></div>` : ''}
+    <div class="de-field"><label>Operação</label><select id="pesos-op">${PESOS_LIST.map(id=>{ const o2 = STATE.operations.find(x=>x.id===id); return `<option value="${id}" ${id===pesosSel.opId?'selected':''}>${o2?o2.name:id}${o2&&o2.pesosCentro?' ('+o2.pesosCentro+')':''}</option>`; }).join('')}</select></div>
     <div class="de-field">
       <label>Mês</label>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -3300,251 +3394,266 @@ function renderPesos(){
   `;
   wrap.appendChild(nav);
 
-  const card = document.createElement('div');
-  card.className = 'de-card';
-  card.innerHTML = `
-    <h3>Lançar pesos de um dia</h3>
-    <div class="de-row" style="margin-bottom:6px;">
-      <div class="de-field">
-        <label>Dia</label>
-        <select id="pesos-day">
-          ${monthDates.map(ds=>{
-            const d = Number(ds.slice(8,10));
-            return `<option value="${ds}" ${ds===pesosSel.date?'selected':''}>${String(d).padStart(2,'0')} — ${weekdayName(ds).slice(0,3)}</option>`;
-          }).join('')}
-        </select>
-      </div>
+  // ---------- Importar ficheiro ----------
+  const impCard = document.createElement('div');
+  impCard.className = 'de-card';
+  let pendingHtml = '';
+  if (pesosPending){
+    const p = pesosPending;
+    const tgt = STATE.operations.find(o=>o.id===p.opId);
+    const other = p.centro ? STATE.operations.find(o=>o.id!==p.opId && o.pesosCentro===p.centro && o.usePesos) : null;
+    const mismatch = p.centro && tgt && tgt.pesosCentro && tgt.pesosCentro!==p.centro;
+    const curEntries = STATE.pesosCache[p.opId] || {};
+    const dates = Object.keys(p.byDate).sort();
+    pendingHtml = `
+      <div style="border:1px solid var(--blue);border-radius:10px;padding:14px 16px;margin-top:14px;background:var(--blue-glow);">
+        <div style="font-weight:700;margin-bottom:4px;">Pré-visualização — ${p.fileName}</div>
+        <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">Folha "${p.sheet}"${p.centro?' · centro '+p.centro:''} · vai para <strong>${tgt?tgt.name:p.opId}</strong></div>
+        ${(other || mismatch) ? `<div style="border:1px solid var(--red);color:var(--red);border-radius:8px;padding:8px 12px;font-size:12.5px;margin-bottom:10px;">${ICONS.warning} Este ficheiro é do centro <strong>${p.centro}</strong>${other?`, que está associado a <strong>${other.name}</strong>`:''}${mismatch?`, mas ${tgt.name} costuma receber o centro <strong>${tgt.pesosCentro}</strong>`:''}. Confirma a operação antes de guardar.
+          ${other?`<button class="de-btn ghost small" id="pesos-switch-target" data-target="${other.id}" style="margin-left:6px;">Importar para ${other.name}</button>`:''}</div>` : ''}
+        <table class="de-table">
+          <thead><tr><th>Data de entrega</th><th>Encomendas</th><th>0–30kg</th><th>31–60kg</th><th>Peso total</th><th></th></tr></thead>
+          <tbody>${dates.map(d=>{
+            const b = bucketizeWeights(p.byDate[d]);
+            const dLabel = d==='__sem_data__' ? '<span style="color:var(--red);">sem data</span>' : d.split('-').reverse().join('/')+' <span style="color:var(--text-faint);">'+weekdayName(d).slice(0,3)+'</span>';
+            const replaces = curEntries[d] && curEntries[d].length ? `<span class="de-badge inactive">substitui ${curEntries[d].length} já lançadas</span>` : '';
+            return `<tr><td>${dLabel}</td><td><strong>${b.total}</strong></td><td style="color:var(--green);font-weight:700;">${b.b1}</td><td style="color:var(--blue);font-weight:700;">${b.b2}</td><td>${fmtKg(b.kg)} kg</td><td>${replaces}${b.acima?` <span class="de-badge" style="background:rgba(229,72,77,.12);color:var(--red);">${b.acima} acima de 60kg</span>`:''}</td></tr>`;
+          }).join('')}</tbody>
+        </table>
+        ${(p.semPeso||p.duplicados||p.semData) ? `<div style="font-size:12px;color:var(--text-dim);margin-top:8px;">${p.semPeso?`${ICONS.warning} ${p.semPeso} encomenda(s) sem peso — contadas no escalão 0–30kg. `:''}${p.duplicados?`${p.duplicados} linha(s) com documento repetido ignorada(s). `:''}${p.semData?`${ICONS.warning} ${p.semData} linha(s) sem data — não serão guardadas.`:''}</div>` : ''}
+        <div style="display:flex;gap:8px;margin-top:12px;">
+          <button class="de-btn" id="pesos-confirm">${ICONS.check} Confirmar e guardar</button>
+          <button class="de-btn ghost" id="pesos-cancel">Cancelar</button>
+        </div>
+      </div>`;
+  }
+  impCard.innerHTML = `
+    <h3>Importar ficheiro da Delta</h3>
+    <div id="pesos-drop" style="border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;cursor:pointer;color:var(--text-dim);font-size:13px;">
+      ${ICONS.upload} Arrasta para aqui o ficheiro <strong>.xlsx</strong> do dia de <strong>${opName}</strong>, ou clica para escolher.<br/>
+      <span style="font-size:11.5px;color:var(--text-faint);">A data usada é a "Data Entrega" de cada linha — não a data do nome do ficheiro.</span>
     </div>
-    <label style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-faint);font-weight:600;display:block;margin-bottom:6px;">Pesos (kg) — um por linha, ou separados por vírgula/espaço</label>
-    <textarea id="pesos-input" rows="6" style="width:100%;background:var(--navy);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-family:var(--font-mono);font-size:13px;resize:vertical;outline:none;box-sizing:border-box;" placeholder="Ex:&#10;12&#10;28,5&#10;45&#10;7"></textarea>
-    <div id="pesos-preview" style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;"></div>
-    <div style="display:flex;gap:10px;margin-top:14px;">
-      <button class="de-btn" id="pesos-save">${ICONS.save} Guardar dia</button>
-      <button class="de-btn ghost" id="pesos-clear">Limpar dia</button>
-    </div>
+    <input type="file" id="pesos-file" accept=".xlsx,.xls,.xlsm" style="display:none;" />
+    <div id="pesos-import-status" style="font-size:12px;color:var(--text-faint);margin-top:8px;"></div>
+    ${pendingHtml}
   `;
-  wrap.appendChild(card);
+  wrap.appendChild(impCard);
 
+  // ---------- Resumo de faturação do mês ----------
   const tableCard = document.createElement('div');
   tableCard.className = 'de-card';
-  let sumTotal=0, sumB1=0, sumB2=0;
+  let sum = { total:0, b1:0, b2:0, kg:0, dias:0 };
   const today = todayISO();
-  // Encomendas = valor do campo "Encomendas" do Registo (não a contagem de pesos lançados)
-  const sumRecords = STATE.recordsCache[pesosSel.opId] || {};
-  const sumEncField = ((op && op.fields) || []).find(f=>f.role==='total');
   const rowsHtml = monthDates.map(ds=>{
     const weights = entries[ds] || [];
-    const { b1, b2, total: nPesos } = bucketizeWeights(weights);
-    const sumRec = sumRecords[ds];
-    const total = (sumEncField && sumRec && !sumRec.noOperation && sumRec.fixed) ? (Number(sumRec.fixed[sumEncField.key])||0) : 0;
-    sumTotal += total; sumB1 += b1; sumB2 += b2;
+    const b = bucketizeWeights(weights);
+    const imp = imports[ds];
+    if (b.total){ sum.total+=b.total; sum.b1+=b.b1; sum.b2+=b.b2; sum.kg+=b.kg; sum.dias++; }
     const d = Number(ds.slice(8,10));
-    const isToday = ds === today;
-    return `<tr ${isToday?'style="background:var(--row-hover);"':''} data-pesos-day-row="${ds}">
+    const origem = !b.total ? '' : imp && imp.fileName
+      ? `<span title="${imp.fileName} — importado ${imp.ts?new Date(imp.ts).toLocaleString('pt-PT'):''}${imp.user?' por '+imp.user:''}" style="font-size:11.5px;color:var(--text-faint);">${ICONS.note} ficheiro</span>`
+      : `<span style="font-size:11.5px;color:var(--text-faint);">manual</span>`;
+    const suspeito = b.acima ? ` <span class="de-badge" title="Há ${b.acima} peso(s) acima de 60kg — pode ter sido lançado com o erro antigo da vírgula. Reimporta o ficheiro deste dia." style="background:rgba(229,72,77,.12);color:var(--red);cursor:help;">verificar</span>` : '';
+    return `<tr ${ds===today?'style="background:var(--row-hover);"':''}${b.total?'':' class="pesos-empty-row"'}>
       <td>${String(d).padStart(2,'0')} <span style="color:var(--text-faint);">${weekdayName(ds).slice(0,3)}</span></td>
-      <td>${total || '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>${nPesos ? `<span style="color:var(--green);font-weight:700;">${b1}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>${nPesos ? `<span style="color:var(--blue);font-weight:700;">${b2}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
-      <td>
-        <button class="de-btn ghost small" data-pesos-edit="${ds}" type="button">${ICONS.pencil}</button>
-        ${nPesos ? `<button class="de-btn danger" data-pesos-del="${ds}" type="button">${ICONS.trash}</button>` : ''}
+      <td>${b.total ? '<strong>'+b.total+'</strong>' : '<span style="color:var(--text-faint);">—</span>'}</td>
+      <td>${b.total ? `<span style="color:var(--green);font-weight:700;">${b.b1}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
+      <td>${b.total ? `<span style="color:var(--blue);font-weight:700;">${b.b2}</span>` : '<span style="color:var(--text-faint);">—</span>'}</td>
+      <td style="font-family:var(--font-mono);font-size:12.5px;">${b.total ? fmtKg(b.kg)+' kg' : ''}</td>
+      <td>${origem}${suspeito}</td>
+      <td style="white-space:nowrap;">
+        <button class="de-btn ghost small" data-pesos-edit="${ds}" type="button" title="Ver / corrigir manualmente">${ICONS.pencil}</button>
+        ${b.total ? `<button class="de-btn danger" data-pesos-del="${ds}" type="button" title="Limpar este dia">${ICONS.trash}</button>` : ''}
       </td>
     </tr>`;
   }).join('');
   tableCard.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-      <h3 style="margin:0;">Resumo do mês</h3>
-      <button class="de-btn ghost small" id="pesos-export">${ICONS.download} Exportar CSV</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
+      <h3 style="margin:0;">Faturação — ${opName} · ${monthName(month)} ${year}</h3>
+      <button class="de-btn ghost small" id="pesos-export">${ICONS.download} Exportar faturação do mês (Excel)</button>
     </div>
-    <table class="de-table">
-      <thead><tr><th>Dia</th><th>Encomendas</th><th>0–30kg</th><th>31kg+</th><th></th></tr></thead>
-      <tbody>${rowsHtml}</tbody>
-      <tfoot><tr style="font-weight:800;">
-        <td>Total</td><td>${sumTotal}</td>
-        <td style="color:var(--green);">${sumB1}</td>
-        <td style="color:var(--blue);">${sumB2}</td>
-        <td></td>
-      </tr></tfoot>
-    </table>
-  `;
-  wrap.appendChild(tableCard);
-
-  // ------------------------------------------------------------
-  // RELATÓRIO COMPLETO DO MÊS — junta o Registo (Encomendas, Entregues,
-  // Não Entregues, Cancelada, Ausente, Recusado, Falhada DE, Morada Errada,
-  // KMS, EDR%) com os escalões de peso (0-30 / 31kg+), no mesmo formato
-  // da folha de cálculo original. Fixo à operação Delta Montijo.
-  // ------------------------------------------------------------
-  const REPORT_OP_ID = pesosSel.opId;
-  const repOp = STATE.operations.find(o=>o.id===REPORT_OP_ID);
-  const repRecords = STATE.recordsCache[REPORT_OP_ID] || {};
-  const repWeights = STATE.pesosCache[REPORT_OP_ID] || {};
-  const repCols = (repOp && repOp.fields) ? repOp.fields : [];
-
-  function diaSemanaLabel(dow){
-    return ['domingo','segunda-feira','terça-feira','quarta-feira','quinta-feira','sexta-feira','sábado'][dow];
-  }
-
-  const colTotals = repCols.map(()=>0);
-  const rTotals = { ent:0, enc:0, b1:0, b2:0 };
-  let diasComDados = 0;
-  const reportRowsData = monthDates.map(ds=>{
-    const d = Number(ds.slice(8,10));
-    const dow = new Date(ds+'T00:00:00').getDay();
-    const rec = repRecords[ds];
-    const hasData = !!(rec && !rec.noOperation);
-    const w = repWeights[ds] || [];
-    const { b1, b2 } = bucketizeWeights(w);
-    if (!hasData) return { d, dow, hasData:false };
-    const f = rec.fixed || {};
-    const vals = repCols.map(c=>Number(f[c.key])||0);
-    const enc = dayTotal(repOp, rec), ent = dayEntregues(repOp, rec);
-    const edr = enc>0 ? ent/enc : null;
-    vals.forEach((v,i)=>{ colTotals[i]+=v; });
-    rTotals.enc+=enc; rTotals.ent+=ent; rTotals.b1+=b1; rTotals.b2+=b2;
-    diasComDados++;
-    return { d, dow, hasData:true, vals, edr, b1, b2 };
-  });
-
-  const reportRowsHtml = reportRowsData.map(r=>{
-    if (!r.hasData){
-      return `<tr><td>${r.d}</td><td style="color:var(--text-faint);">${diaSemanaLabel(r.dow)}</td><td colspan="${repCols.length+4}"></td></tr>`;
-    }
-    return `<tr>
-      <td>${r.d}</td>
-      <td>${diaSemanaLabel(r.dow)}</td>
-      ${r.vals.map((v,i)=>`<td${repCols[i].role==='nao_entregues'?' style="color:var(--red);"':''}>${fmt(v)}</td>`).join('')}
-      <td>${edrHtml(r.edr)}</td>
-      <td style="color:var(--green);font-weight:700;">${r.b1||'—'}</td>
-      <td style="color:var(--blue);font-weight:700;">${r.b2||'—'}</td>
-      <td style="font-weight:800;">${(r.b1+r.b2)||'—'}</td>
-    </tr>`;
-  }).join('');
-
-  const rEdrTotal = rTotals.enc>0 ? rTotals.ent/rTotals.enc : null;
-  const mDias = diasComDados || 1;
-  const avg = n => fmt(n/mDias);
-
-  const reportCard = document.createElement('div');
-  reportCard.className = 'de-card';
-  reportCard.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-      <h3 style="margin:0;">Relatório completo — ${repOp ? repOp.name : REPORT_OP_ID}</h3>
-      <button class="de-btn ghost small" id="pesos-report-export">${ICONS.download} Exportar CSV</button>
+    <div class="de-kpis" style="margin-bottom:14px;">
+      <div class="de-kpi"><div class="label">Encomendas no mês</div><div class="value">${sum.total}</div></div>
+      <div class="de-kpi"><div class="label">Escalão 0–30kg</div><div class="value green">${sum.b1}</div></div>
+      <div class="de-kpi"><div class="label">Escalão 31–60kg</div><div class="value blue">${sum.b2}</div></div>
+      <div class="de-kpi"><div class="label">Dias com dados</div><div class="value">${sum.dias}</div></div>
     </div>
     <div style="overflow-x:auto;">
     <table class="de-table">
-      <thead><tr>
-        <th>Dia</th><th>Dia Semana</th>${repCols.map(c=>`<th>${c.label}</th>`).join('')}<th>EDR%</th><th>0 - 30</th><th>31kg+</th><th>Total</th>
-      </tr></thead>
-      <tbody>${reportRowsHtml}</tbody>
-      <tfoot>
-        <tr style="font-weight:800;">
-          <td colspan="2">TOTAL</td>
-          ${colTotals.map((t,i)=>`<td${repCols[i].role==='nao_entregues'?' style="color:var(--red);"':''}>${fmt(t)}</td>`).join('')}
-          <td>${edrHtml(rEdrTotal)}</td>
-          <td style="color:var(--green);">${rTotals.b1}</td><td style="color:var(--blue);">${rTotals.b2}</td>
-          <td>${rTotals.b1 + rTotals.b2}</td>
-        </tr>
-        <tr style="font-weight:800;">
-          <td colspan="2">MÉDIA</td>
-          ${colTotals.map((t,i)=>`<td${repCols[i].role==='nao_entregues'?' style="color:var(--red);"':''}>${avg(t)}</td>`).join('')}
-          <td>—</td>
-          <td style="color:var(--green);">${avg(rTotals.b1)}</td><td style="color:var(--blue);">${avg(rTotals.b2)}</td>
-          <td>${avg(rTotals.b1 + rTotals.b2)}</td>
-        </tr>
-      </tfoot>
+      <thead><tr><th>Dia</th><th>Encomendas</th><th>0–30kg</th><th>31–60kg</th><th>Peso total</th><th>Origem</th><th></th></tr></thead>
+      <tbody>${rowsHtml}</tbody>
+      <tfoot><tr style="font-weight:800;">
+        <td>Total</td><td>${sum.total}</td>
+        <td style="color:var(--green);">${sum.b1}</td>
+        <td style="color:var(--blue);">${sum.b2}</td>
+        <td style="font-family:var(--font-mono);font-size:12.5px;">${fmtKg(sum.kg)} kg</td>
+        <td colspan="2"></td>
+      </tr></tfoot>
     </table>
     </div>
   `;
-  wrap.appendChild(reportCard);
+  wrap.appendChild(tableCard);
+
+  // ---------- Lançamento manual (alternativa / correções) ----------
+  const manCard = document.createElement('div');
+  manCard.className = 'de-card';
+  manCard.innerHTML = `
+    <div class="de-flex-between" style="margin-bottom:${pesosManualOpen?'12px':'0'};">
+      <h3 style="margin-bottom:0;">Lançamento manual — ${pesosSel.date.split('-').reverse().join('/')}</h3>
+      <button class="de-btn ghost small" id="pesos-toggle-manual">${pesosManualOpen?'▲ Ocultar':'▼ Abrir'}</button>
+    </div>
+    ${pesosManualOpen ? `
+    <div class="de-row" style="margin-bottom:6px;">
+      <div class="de-field"><label>Dia</label>
+        <select id="pesos-day">${monthDates.map(ds=>`<option value="${ds}" ${ds===pesosSel.date?'selected':''}>${ds.slice(8,10)} — ${weekdayName(ds).slice(0,3)}</option>`).join('')}</select>
+      </div>
+    </div>
+    <label style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-faint);font-weight:600;display:block;margin-bottom:6px;">Pesos (kg) — um por linha. A vírgula é a casa decimal (19,765 = 19,765 kg)</label>
+    <textarea id="pesos-input" rows="6" style="width:100%;background:var(--navy);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-family:var(--font-mono);font-size:13px;resize:vertical;outline:none;box-sizing:border-box;" placeholder="Ex:&#10;19,765&#10;9,155&#10;29,595"></textarea>
+    <div id="pesos-preview" style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;"></div>
+    <div style="display:flex;gap:10px;margin-top:14px;">
+      <button class="de-btn" id="pesos-save">${ICONS.save} Guardar dia</button>
+      <button class="de-btn ghost" id="pesos-clear">Limpar caixa</button>
+    </div>` : ''}
+  `;
+  wrap.appendChild(manCard);
 
   body.innerHTML = '';
   body.appendChild(wrap);
 
-  document.getElementById('pesos-report-export').onclick = ()=>{
-    let csv = 'Dia;Dia Semana;' + repCols.map(c=>c.label).join(';') + ';EDR%;0-30;31kg+;Total\n';
-    reportRowsData.forEach(r=>{
-      if (!r.hasData){ csv += `${r.d};${diaSemanaLabel(r.dow)}${';'.repeat(repCols.length+4)}\n`; return; }
-      const edrPct = r.edr!==null ? (Math.round(r.edr*1000)/10)+'%' : '';
-      csv += `${r.d};${diaSemanaLabel(r.dow)};${r.vals.join(';')};${edrPct};${r.b1};${r.b2};${r.b1+r.b2}\n`;
-    });
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${REPORT_OP_ID}-relatorio-${pesosSel.date.slice(0,7)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  // ---------- wiring ----------
+  document.getElementById('pesos-op').onchange = (e)=>{ pesosSel.opId = e.target.value; render(); };
+  document.getElementById('pesos-prev-month').onclick = ()=>{
+    const d = new Date(pesosSel.date.slice(0,8)+'01T00:00:00'); d.setMonth(d.getMonth()-1, 1);
+    pesosSel.date = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-01'; render();
+  };
+  document.getElementById('pesos-next-month').onclick = ()=>{
+    const d = new Date(pesosSel.date.slice(0,8)+'01T00:00:00'); d.setMonth(d.getMonth()+1, 1);
+    pesosSel.date = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-01'; render();
   };
 
-  // ---- wiring ----
-  function updatePreview(){
-    const weights = parseWeights(document.getElementById('pesos-input').value);
-    const { b1, b2, total } = bucketizeWeights(weights);
-    document.getElementById('pesos-preview').innerHTML = `
-      <span class="de-badge active">${total} encomenda${total===1?'':'s'}</span>
-      <span class="de-badge" style="background:rgba(34,194,116,0.14);color:var(--green);">0–30kg: ${b1}</span>
-      <span class="de-badge" style="background:var(--blue-glow);color:var(--blue);">31kg+: ${b2}</span>
-    `;
+  const statusEl = document.getElementById('pesos-import-status');
+  async function handleFile(file){
+    if (!file) return;
+    statusEl.textContent = 'A ler ficheiro…';
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type:'array', cellDates:true });
+      const res = parseDeltaWorkbook(wb, file.name);
+      if (!res.ok){ statusEl.innerHTML = ICONS.warning+' '+res.error; pesosPending = null; return; }
+      pesosPending = { ...res, opId: pesosSel.opId, fileName: file.name };
+      render();
+    } catch(err){
+      console.error(err);
+      statusEl.innerHTML = ICONS.warning+' Não foi possível ler este ficheiro. Confirma que é um .xlsx válido.';
+    }
   }
-  const input = document.getElementById('pesos-input');
-  input.value = (entries[pesosSel.date] || []).join('\n');
-  updatePreview();
-  input.oninput = updatePreview;
+  const drop = document.getElementById('pesos-drop');
+  const fileInput = document.getElementById('pesos-file');
+  drop.onclick = ()=>fileInput.click();
+  fileInput.onchange = (e)=>{ handleFile(e.target.files[0]); e.target.value=''; };
+  drop.ondragover = (e)=>{ e.preventDefault(); drop.style.borderColor='var(--blue)'; };
+  drop.ondragleave = ()=>{ drop.style.borderColor='var(--border)'; };
+  drop.ondrop = (e)=>{ e.preventDefault(); drop.style.borderColor='var(--border)'; handleFile(e.dataTransfer.files[0]); };
 
-  const opSelect = document.getElementById('pesos-op');
-  if (opSelect) opSelect.onchange = (e)=>{ pesosSel.opId = e.target.value; render(); };
-
-  document.getElementById('pesos-day').onchange = (e)=>{ pesosSel.date = e.target.value; render(); };
-  document.getElementById('pesos-prev-month').onclick = ()=>{ pesosSel.date = addDays(pesosSel.date.slice(0,8)+'01', -1); pesosSel.date = pesosSel.date.slice(0,8)+'01'; render(); };
-  document.getElementById('pesos-next-month').onclick = ()=>{
-    const d = new Date(pesosSel.date+'T00:00:00');
-    d.setMonth(d.getMonth()+1, 1);
-    pesosSel.date = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-01';
+  const switchBtn = document.getElementById('pesos-switch-target');
+  if (switchBtn) switchBtn.onclick = ()=>{ pesosPending.opId = switchBtn.dataset.target; pesosSel.opId = switchBtn.dataset.target; render(); };
+  const cancelBtn = document.getElementById('pesos-cancel');
+  if (cancelBtn) cancelBtn.onclick = ()=>{ pesosPending = null; render(); };
+  const confirmBtn = document.getElementById('pesos-confirm');
+  if (confirmBtn) confirmBtn.onclick = async ()=>{
+    const p = pesosPending;
+    const tgt = STATE.operations.find(o=>o.id===p.opId);
+    confirmBtn.disabled = true; confirmBtn.textContent = 'A guardar…';
+    const user = await getUserName();
+    const newEntries = { ...(STATE.pesosCache[p.opId] || {}) };
+    const newImports = { ...(STATE.pesosImports[p.opId] || {}) };
+    const saved = [];
+    Object.keys(p.byDate).sort().forEach(d=>{
+      if (d==='__sem_data__') return;
+      newEntries[d] = p.byDate[d].map(w=>Math.round(w*1000)/1000);
+      newImports[d] = { fileName: p.fileName, centro: p.centro || null, ts: new Date().toISOString(), user };
+      saved.push(d);
+    });
+    const ok = await savePesos(p.opId, newEntries, newImports);
+    if (!ok){ confirmBtn.disabled = false; confirmBtn.textContent = 'Confirmar e guardar'; return; }
+    // Memoriza o centro da operação para avisar se um ficheiro for importado na operação errada
+    if (tgt && p.centro && !tgt.pesosCentro){ tgt.pesosCentro = p.centro; await saveOperations(STATE.operations); }
+    const totais = saved.map(d=>{ const b = bucketizeWeights(newEntries[d]); return `${d}: ${b.total} enc. (${b.b1} até 30kg / ${b.b2} 31kg+)`; }).join('; ');
+    await logEdit('Importou ficheiro de pesos', `${tgt?tgt.name:p.opId} — ${p.fileName} — ${totais}`);
+    if (saved.length) pesosSel.date = saved[0];
+    pesosPending = null;
+    toast(ICONS.check+` Ficheiro importado — ${saved.length} dia(s) guardado(s)`);
     render();
   };
 
-  document.getElementById('pesos-save').onclick = async ()=>{
-    const weights = parseWeights(input.value);
-    const updated = { ...(STATE.pesosCache[pesosSel.opId] || {}) };
-    if (weights.length === 0) delete updated[pesosSel.date];
-    else updated[pesosSel.date] = weights;
-    const ok = await savePesos(pesosSel.opId, updated);
-    if (ok){ toast(ICONS.check+' Pesos do dia guardados'); await logEdit('Pesos guardados', `${opName} — ${pesosSel.date} — ${weights.length} encomenda(s)`); render(); }
-  };
-  document.getElementById('pesos-clear').onclick = ()=>{ input.value=''; updatePreview(); };
+  document.getElementById('pesos-toggle-manual').onclick = ()=>{ pesosManualOpen = !pesosManualOpen; render(); };
+  if (pesosManualOpen){
+    const input = document.getElementById('pesos-input');
+    function updatePreview(){
+      const b = bucketizeWeights(parseWeights(input.value));
+      document.getElementById('pesos-preview').innerHTML = `
+        <span class="de-badge active">${b.total} encomenda${b.total===1?'':'s'}</span>
+        <span class="de-badge" style="background:rgba(34,194,116,0.14);color:var(--green);">0–30kg: ${b.b1}</span>
+        <span class="de-badge" style="background:var(--blue-glow);color:var(--blue);">31–60kg: ${b.b2}</span>
+        ${b.acima?`<span class="de-badge" style="background:rgba(229,72,77,.12);color:var(--red);">${b.acima} acima de 60kg — confirma</span>`:''}`;
+    }
+    input.value = (entries[pesosSel.date] || []).map(w=>String(w).replace('.',',')).join('\n');
+    updatePreview();
+    input.oninput = updatePreview;
+    document.getElementById('pesos-day').onchange = (e)=>{ pesosSel.date = e.target.value; render(); };
+    document.getElementById('pesos-clear').onclick = ()=>{ input.value=''; updatePreview(); };
+    document.getElementById('pesos-save').onclick = async ()=>{
+      const weights = parseWeights(input.value);
+      const updated = { ...(STATE.pesosCache[pesosSel.opId] || {}) };
+      const updImports = { ...(STATE.pesosImports[pesosSel.opId] || {}) };
+      if (weights.length === 0){ delete updated[pesosSel.date]; delete updImports[pesosSel.date]; }
+      else { updated[pesosSel.date] = weights; delete updImports[pesosSel.date]; }
+      const ok = await savePesos(pesosSel.opId, updated, updImports);
+      if (ok){ toast(ICONS.check+' Pesos do dia guardados'); await logEdit('Pesos guardados (manual)', `${opName} — ${pesosSel.date} — ${weights.length} encomenda(s)`); render(); }
+    };
+  }
 
   document.getElementById('pesos-export').onclick = ()=>{
-    let csv = 'Dia;Encomendas;0-30kg;31kg+\n';
-    monthDates.forEach(ds=>{
-      const { b1, b2, total } = bucketizeWeights(entries[ds] || []);
-      csv += `${ds};${total};${b1};${b2}\n`;
+    // Uma folha por operação com pesos (ex: Delta Lisboa e Delta Montijo) + resumo
+    const wbOut = XLSX.utils.book_new();
+    const resumo = [['Operação','Encomendas','0–30kg','31–60kg','Peso total (kg)','Dias com dados']];
+    PESOS_LIST.forEach(id=>{
+      const o = STATE.operations.find(x=>x.id===id);
+      const ent = STATE.pesosCache[id] || {};
+      const imp = STATE.pesosImports[id] || {};
+      const rows = [['Dia','Dia da semana','Encomendas','0–30kg','31–60kg','Peso total (kg)','Origem']];
+      const t = { total:0, b1:0, b2:0, kg:0, dias:0 };
+      monthDates.forEach(ds=>{
+        const b = bucketizeWeights(ent[ds] || []);
+        if (b.total){ t.total+=b.total; t.b1+=b.b1; t.b2+=b.b2; t.kg+=b.kg; t.dias++; }
+        rows.push([ds.split('-').reverse().join('/'), weekdayName(ds), b.total||'', b.total?b.b1:'', b.total?b.b2:'', b.total?Math.round(b.kg*10)/10:'', b.total?((imp[ds]&&imp[ds].fileName)||'manual'):'']);
+      });
+      rows.push(['TOTAL','',t.total,t.b1,t.b2,Math.round(t.kg*10)/10,'']);
+      resumo.push([o?o.name:id, t.total, t.b1, t.b2, Math.round(t.kg*10)/10, t.dias]);
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws['!cols'] = [{wch:12},{wch:14},{wch:12},{wch:10},{wch:10},{wch:15},{wch:50}];
+      XLSX.utils.book_append_sheet(wbOut, ws, String(o?o.name:id).replace(/[\\\/\?\*\[\]:]/g,'').slice(0,31));
     });
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${pesosSel.opId}-pesos-${pesosSel.date.slice(0,7)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const wsR = XLSX.utils.aoa_to_sheet(resumo);
+    wsR['!cols'] = [{wch:24},{wch:12},{wch:10},{wch:10},{wch:15},{wch:15}];
+    XLSX.utils.book_append_sheet(wbOut, wsR, 'Resumo');
+    wbOut.SheetNames.unshift(wbOut.SheetNames.pop());
+    XLSX.writeFile(wbOut, `faturacao-pesos-${pesosSel.date.slice(0,7)}.xlsx`);
   };
 
   wrap.querySelectorAll('[data-pesos-edit]').forEach(btn=>{
-    btn.onclick = ()=>{
-      pesosSel.date = btn.dataset.pesosEdit;
-      render();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    };
+    btn.onclick = ()=>{ pesosSel.date = btn.dataset.pesosEdit; pesosManualOpen = true; render(); setTimeout(()=>{ const i=document.getElementById('pesos-input'); if(i){ i.scrollIntoView({behavior:'smooth',block:'center'}); } },50); };
   });
   wrap.querySelectorAll('[data-pesos-del]').forEach(btn=>{
     btn.onclick = async ()=>{
       const ds = btn.dataset.pesosDel;
-      if (!confirm(`Limpar os pesos do dia ${ds.split('-').reverse().join('/')}?`)) return;
+      if (!confirm(`Limpar os pesos de ${opName} do dia ${ds.split('-').reverse().join('/')}?`)) return;
       const updated = { ...(STATE.pesosCache[pesosSel.opId] || {}) };
-      delete updated[ds];
-      const ok = await savePesos(pesosSel.opId, updated);
-      if (ok){ toast('Dia limpo'); render(); }
+      const updImports = { ...(STATE.pesosImports[pesosSel.opId] || {}) };
+      delete updated[ds]; delete updImports[ds];
+      const ok = await savePesos(pesosSel.opId, updated, updImports);
+      if (ok){ await logEdit('Limpou pesos do dia', `${opName} — ${ds}`); toast('Dia limpo'); render(); }
     };
   });
 }
@@ -4426,6 +4535,7 @@ async function init(){
     await Promise.all(pesosOps().map(async opId=>{
       const pesosSnap = await db.collection('pesos').doc(opId).get();
       STATE.pesosCache[opId] = pesosSnap.exists ? (pesosSnap.data().entries || {}) : {};
+      STATE.pesosImports[opId] = pesosSnap.exists ? (pesosSnap.data().imports || {}) : {};
     }));
 
     await autoImportHistoricoIfNeeded();
