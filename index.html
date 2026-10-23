@@ -2452,7 +2452,7 @@ function renderAnalises(){
 // Card com logo, KPIs, nível de serviço diário e motivos das não entregues.
 // Funciona para qualquer cliente (campos fixos ou por motorista/região).
 // Exporta como imagem: copiar, descarregar PNG ou partilhar (telemóvel).
-let panSel = { opId:null, year:null, month:null, hideZero:true };
+let panSel = { opId:null, year:null, month:null, hideZero:false, loja:'all', entity:'all' };
 
 function panLoadHidden(opId){ try { return JSON.parse(localStorage.getItem('de-pan-hidden-'+opId)||'[]'); } catch(e){ return []; } }
 function panSaveHidden(opId, arr){ try { localStorage.setItem('de-pan-hidden-'+opId, JSON.stringify(arr)); } catch(e){} }
@@ -2466,11 +2466,12 @@ function panMotivoFields(op){
   return out;
 }
 // Valor de um campo num dia: soma das entidades se houver; senão o campo fixo
-function panFieldVal(op, rec, key){
+function panFieldVal(op, rec, key, entityFilter){
   if (!rec) return 0;
   let s = 0, has = false;
-  Object.values(rec.entities||{}).forEach(ev=>{ if (ev && ev[key]!==undefined && ev[key]!==''){ s += Number(ev[key])||0; has = true; } });
+  Object.entries(rec.entities||{}).forEach(([ent,ev])=>{ if (entityFilter && !entityFilter.has(ent)) return; if (ev && ev[key]!==undefined && ev[key]!==''){ s += Number(ev[key])||0; has = true; } });
   if (has) return s;
+  if (entityFilter) return 0;
   return Number(rec.fixed && rec.fixed[key]) || 0;
 }
 // Motivos que NÃO contam para o nível de serviço (ex: Anulados)
@@ -2481,7 +2482,7 @@ function panLevelColor(edr){
   if (edr >= 0.90) return { bg:'#fdf0d5', fg:'#a86b00' };
   return { bg:'#fde2e3', fg:'#c3262d' };
 }
-function panComputeMonth(op, year, month){
+function panComputeMonth(op, year, month, ef){
   const records = STATE.recordsCache[op.id] || {};
   const lastDay = daysInMonth(year, month);
   const t = todayISO();
@@ -2501,23 +2502,23 @@ function panComputeMonth(op, year, month){
     const row = { d, ds, dow, status:'vazio', ent:0, nao:0, total:0, edr:null, mot:{} };
     if (rec && rec.noOperation) row.status = 'semop';
     else if (rec && !rec.monthlySummary){
-      const ent = dayEntregues(op, rec), total = dayTotal(op, rec);
-      const nao = hasNaoField ? sumRoleForDate(op, rec, 'nao_entregues') : Math.max(0, total-ent);
+      const ent = dayEntregues(op, rec, ef), total = dayTotal(op, rec, ef);
+      const nao = hasNaoField ? sumRoleForDate(op, rec, 'nao_entregues', ef) : Math.max(0, total-ent);
       if (ent || total || nao){
         row.status = 'ok'; row.ent = ent; row.nao = nao; row.total = total; row.edr = total>0 ? ent/total : null;
-        motivos.forEach(m=>{ const v = panFieldVal(op, rec, m.key); row.mot[m.key] = v; tot.mot[m.key] += v; });
+        motivos.forEach(m=>{ const v = panFieldVal(op, rec, m.key, ef); row.mot[m.key] = v; tot.mot[m.key] += v; });
         tot.ent += ent; tot.nao += nao; tot.total += total; tot.dias++;
       }
     }
     days.push(row);
   }
-  if (summary && !tot.dias){ // mês registado só como total mensal
+  if (summary && !tot.dias && !ef){ // mês registado só como total mensal
     tot.ent = dayEntregues(op, summary); tot.total = dayTotal(op, summary);
     tot.nao = hasNaoField ? sumRoleForDate(op, summary, 'nao_entregues') : Math.max(0, tot.total-tot.ent);
     motivos.forEach(m=>tot.mot[m.key] = panFieldVal(op, summary, m.key));
   }
   tot.edr = tot.total>0 ? tot.ent/tot.total : null;
-  return { days, tot, motivos, isCurrent, upTo, lastDay, onlySummary: !!(summary && !tot.dias) };
+  return { days, tot, motivos, isCurrent, upTo, lastDay, onlySummary: !!(summary && !tot.dias && !ef) };
 }
 
 function pctPT(v){ return (v===null||v===undefined||isNaN(v)) ? '—' : (v*100).toFixed(2).replace('.',',')+'%'; }
@@ -2536,6 +2537,8 @@ function renderPanorama(wrap){
   controls.className = 'de-row';
   controls.innerHTML = `
     <div class="de-field"><label>Cliente</label><select id="pan-op">${ops.map(o=>`<option value="${o.id}" ${o.id===panSel.opId?'selected':''}>${o.name}${o.active?'':' (inativa)'}</option>`).join('')}</select></div>
+    <div class="de-field" id="pan-loja-field" style="display:none;"><label>Loja</label><select id="pan-loja"></select></div>
+    <div class="de-field" id="pan-entity-field" style="display:none;"><label id="pan-entity-label">Motorista</label><select id="pan-entity"></select></div>
     <div class="de-field"><label>Mês</label><select id="pan-month">${[1,2,3,4,5,6,7,8,9,10,11,12].map(m=>`<option value="${m}" ${m===panSel.month?'selected':''}>${monthName(m)}</option>`).join('')}</select></div>
     <div class="de-field"><label>Ano</label><select id="pan-year">${sectorYearOptions().map(y=>`<option value="${y}" ${y===panSel.year?'selected':''}>${y}</option>`).join('')}</select></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;">
@@ -2546,7 +2549,34 @@ function renderPanorama(wrap){
   `;
   wrap.appendChild(controls);
 
-  const data = panComputeMonth(op, panSel.year, panSel.month);
+  // ---- Filtro por loja / região / motorista (operações com registo por entidade) ----
+  let ef = null, filtroLabel = '';
+  if (op.repeating && op.repeating.entities.length){
+    const meta = op.repeating.entityMeta || {};
+    const lojas = [...new Set(Object.values(meta).map(m=>m&&m.loja).filter(Boolean))].sort();
+    if (panSel.loja!=='all' && !lojas.includes(panSel.loja)) panSel.loja = 'all';
+    if (lojas.length){
+      controls.querySelector('#pan-loja-field').style.display = '';
+      const sel = controls.querySelector('#pan-loja');
+      sel.innerHTML = `<option value="all">Todas as lojas</option>${lojas.map(l=>`<option value="${l}" ${l===panSel.loja?'selected':''}>${l}</option>`).join('')}`;
+      sel.onchange = e=>{ panSel.loja = e.target.value; panSel.entity = 'all'; render(); };
+    }
+    // entidades = todas as que existem nos registos do mês + as cadastradas
+    const recsMes = Object.entries(STATE.recordsCache[op.id]||{}).filter(([d])=>d.startsWith(panSel.year+'-'+String(panSel.month).padStart(2,'0')));
+    const entSet = new Set(op.repeating.entities);
+    recsMes.forEach(([,r])=>Object.keys((r&&r.entities)||{}).forEach(e=>{ if (!/sem detalhe|importado/i.test(e)) entSet.add(e); }));
+    const ents = [...entSet].filter(e=>panSel.loja==='all' || (meta[e]||{}).loja===panSel.loja).sort((a,b)=>a.localeCompare(b));
+    if (panSel.entity!=='all' && !ents.includes(panSel.entity)) panSel.entity = 'all';
+    controls.querySelector('#pan-entity-field').style.display = '';
+    controls.querySelector('#pan-entity-label').textContent = op.repeating.entityLabel;
+    const es = controls.querySelector('#pan-entity');
+    es.innerHTML = `<option value="all">${lojas.length && panSel.loja!=='all' ? 'Toda a loja' : 'Todos'}</option>${ents.map(e=>`<option value="${e}" ${e===panSel.entity?'selected':''}>${e}${meta[e]&&meta[e].loja&&panSel.loja==='all'?' — '+meta[e].loja:''}</option>`).join('')}`;
+    es.onchange = e=>{ panSel.entity = e.target.value; render(); };
+    if (panSel.entity!=='all'){ ef = new Set([panSel.entity]); filtroLabel = panSel.entity; }
+    else if (panSel.loja!=='all'){ ef = new Set(ents); filtroLabel = panSel.loja; }
+  }
+
+  const data = panComputeMonth(op, panSel.year, panSel.month, ef);
   const hidden = new Set(panLoadHidden(op.id));
   const motivosVis = data.motivos.filter(m=>!hidden.has(m.key) && !(panSel.hideZero && !data.tot.mot[m.key]));
 
@@ -2644,7 +2674,7 @@ function renderPanorama(wrap){
         <div style="width:1px;height:52px;background:rgba(255,255,255,.22);"></div>
         <div>
           <div style="font-size:11px;font-weight:800;letter-spacing:.16em;color:#8fb0ff;text-transform:uppercase;">Panorama operacional</div>
-          <div style="font-size:26px;font-weight:900;color:#fff;letter-spacing:-.01em;margin-top:2px;">${op.name}</div>
+          <div style="font-size:26px;font-weight:900;color:#fff;letter-spacing:-.01em;margin-top:2px;">${op.name}${filtroLabel?` <span style="color:#8fb0ff;font-weight:800;">· ${filtroLabel}</span>`:''}</div>
         </div>
       </div>
       <div style="text-align:right;">
@@ -2726,7 +2756,7 @@ function renderPanorama(wrap){
   }, 0);
 
   // ---------- interações ----------
-  controls.querySelector('#pan-op').onchange = e=>{ panSel.opId = e.target.value; render(); };
+  controls.querySelector('#pan-op').onchange = e=>{ panSel.opId = e.target.value; panSel.loja = 'all'; panSel.entity = 'all'; render(); };
   controls.querySelector('#pan-month').onchange = e=>{ panSel.month = Number(e.target.value); render(); };
   controls.querySelector('#pan-year').onchange = e=>{ panSel.year = Number(e.target.value); render(); };
   colBar.querySelector('#pan-hidezero') && (colBar.querySelector('#pan-hidezero').onchange = e=>{ panSel.hideZero = e.target.checked; render(); });
@@ -2746,7 +2776,7 @@ function renderPanorama(wrap){
     tr.onclick = ()=>{ registoSel.opId = op.id; registoSel.date = tr.dataset.panDay; STATE.tab='registo'; render(); };
   });
 
-  const fileName = `Panorama-${slug(op.name)}-${panSel.year}-${String(panSel.month).padStart(2,'0')}.png`;
+  const fileName = `Panorama-${slug(op.name)}${filtroLabel?'-'+slug(filtroLabel):''}-${panSel.year}-${String(panSel.month).padStart(2,'0')}.png`;
   async function makeBlob(){
     await panEnsureHtml2Canvas();
     const w = Math.max(card.scrollWidth, card.offsetWidth), h = card.scrollHeight;
@@ -2782,7 +2812,7 @@ function renderPanorama(wrap){
     const blob = await makeBlob();
     const file = new File([blob], fileName, { type:'image/png' });
     if (navigator.canShare && navigator.canShare({ files:[file] })){
-      try { await navigator.share({ files:[file], title: op.name+' — '+monthLabel }); } catch(err){ if (err.name!=='AbortError') throw err; }
+      try { await navigator.share({ files:[file], title: op.name+(filtroLabel?' · '+filtroLabel:'')+' — '+monthLabel }); } catch(err){ if (err.name!=='AbortError') throw err; }
     } else { downloadBlob(blob); toast('Partilha direta só no telemóvel — imagem descarregada'); }
   });
 }
